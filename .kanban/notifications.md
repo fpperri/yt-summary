@@ -52,3 +52,9 @@
   level: info
   message: "Board named `yt-summary` in config.yaml (file created for this) for the card-mention standard; more: ruled 2026-09-03 by franc in the root grill, spec in kanban.proj#237 kanban: card-mention standard + declared board `name:` (contract rev); cross-board mentions now read yt-summary#<id> Title; rename the value if you prefer another name."
   read: false
+- id: 10
+  at: 2026-09-04T13:09:51
+  from: "skill:kanban"
+  level: info
+  message: "PR #1 (yt-summary) opened for the ingest, digest and mass-ingest work; more: head pr/ingest-digest-sweep cut at db5d0c4 plus b684222 (readme install path corrected to fpperri/yt-summary), base master, https://github.com/fpperri/yt-summary/pull/1. Franc chose to keep .kanban/ out of the PR, so commit 422bf8b on feat/ingest-digest-sweep (the board) is not pushed. Review stickers on yt-summary#4 Ingest skill: port the single-video engine into this plugin, yt-summary#5 Digest skill: generic analysis + study guide from a transcript or text and yt-summary#6 Mass-ingest skill: channel/playlist sweep over a subscription manifest left as free text — not rewritten to a machine shape."
+  read: false
