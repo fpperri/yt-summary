@@ -28,16 +28,50 @@ DEFAULT_OUTPUT_DIR = "output"
 _VIDEO_ID_LINE = re.compile(r"^video_id:\s*\"?([A-Za-z0-9_-]{11})\"?\s*$", re.M)
 
 
+def fetch_metadata_oembed(video_id: str) -> tuple[str, str]:
+    """(title, channel) from YouTube's oembed endpoint. It carries no upload
+    date, which is why it is the fallback rather than the primary.
+
+    Does no certificate handling, same as the rest of this plugin: urllib's
+    default context already honors SSL_CERT_FILE where a proxy makes that
+    necessary."""
+    import json
+    import urllib.parse
+    import urllib.request
+    watch = f"https://www.youtube.com/watch?v={video_id}"
+    url = "https://www.youtube.com/oembed?url=%s&format=json" % urllib.parse.quote(watch, safe="")
+    with urllib.request.urlopen(url, timeout=30) as fh:
+        data = json.load(fh)
+    return (data.get("title") or "").strip(), (data.get("author_name") or "").strip()
+
+
 def fetch_metadata(video_id: str) -> tuple[str, str, str]:
-    """(title, channel, upload_date) via yt-dlp; empty strings if unavailable."""
+    """(title, channel, upload_date); empty strings for whatever is unavailable.
+
+    Channel and title decide the slug, so losing them does not cost a field --
+    it files the video under its own id where nobody will find it again. That is
+    worth a second attempt by a different route when the first route fails.
+    """
     cmd = [
         "yt-dlp", "--skip-download", "--no-warnings",
         "--print", "%(title)s\t%(channel)s\t%(upload_date)s",
         f"https://www.youtube.com/watch?v={video_id}",
     ]
-    out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
-    fields = (out.strip().split("\t") + ["", "", ""])[:3]
-    return tuple("" if f == "NA" else f.strip() for f in fields)
+    title = channel = upload_date = ""
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+        fields = (out.strip().split("\t") + ["", "", ""])[:3]
+        title, channel, upload_date = ("" if f == "NA" else f.strip() for f in fields)
+    except Exception:
+        pass
+
+    if not (title and channel):
+        try:
+            title, channel = fetch_metadata_oembed(video_id)
+        except Exception:
+            pass
+
+    return title, channel, upload_date
 
 
 def transcript_video_id(path) -> str | None:
