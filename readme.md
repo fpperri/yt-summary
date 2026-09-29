@@ -62,10 +62,11 @@ python scripts/sweep.py my-channels.txt --output-dir output --since-days 7
 ```
 
 `sweep.py` exits `0` on a clean run, `1` if a video or a whole channel failed and
-nothing was ingested, `2` if it gave up rate-limited — see the comment above
-`exit_code` in `scripts/sweep.py` for the exact rule. Both `sweep.py` and
-`channel_videos.py` take `--max-listed` to cap how many videos are listed per
-channel tab (default 100 once a date window is in play; see `scripts/sweep.py
+nothing was ingested, `2` if the run — or a whole channel's walk — gave up
+rate-limited without ingesting anything; see the comment above `exit_code` in
+`scripts/sweep.py` for the exact rule. Both `sweep.py` and `channel_videos.py`
+take `--max-listed` to cap how many videos are listed per channel tab (`0` =
+unlimited; default 100 once a date window is in play; see `scripts/sweep.py
 --help` / `scripts/channel_videos.py --help`).
 
 An ingested video lands as:

@@ -55,13 +55,18 @@ they can take hours if YouTube starts rate-limiting.
 
 Useful flags: `--limit-per-channel N` to cap each channel, `--pace N` for seconds
 between fetches (default 8), `--log FILE` to keep a run log, `--no-api` to skip
-the API endpoint once it starts blocking.
+the API endpoint once it starts blocking, `--max-listed N` to cap how many
+videos are listed per channel tab (default 100, `0` = unlimited).
 
 ### 3. Report and hand off
 
-Report ingested / skipped / failed counts and anything worth a retry. To analyze
-what came in, run `yt-summary:digest` over the new transcripts — those are
-independent per video and can be fanned out in parallel.
+Report ingested / skipped / failed counts and anything worth a retry. Exit code
+is `0` on a clean run, `1` if a video or a whole channel failed and nothing was
+ingested, `2` if the run — or a whole channel's walk — gave up rate-limited
+without ingesting anything.
+
+To analyze what came in, run `yt-summary:digest` over the new transcripts —
+those are independent per video and can be fanned out in parallel.
 
 ## Behavior worth knowing
 
@@ -82,7 +87,14 @@ hand and rediscover them:
   long-running channel costs a handful of probes rather than one per video.
 - **Rate limits are expected.** A throttled video is retried after an exponential
   backoff (up to ~1h) rather than abandoned; the run stops only after
-  `--max-block` consecutive blocks.
+  `--max-block` consecutive blocks. A channel walk that gives up rate-limited
+  is logged as `CHANNEL-FAIL <url> (rate limited): <msg>` and counted so a
+  rate-limited run can still exit `2` even though nothing else failed.
+- **A capped listing near the window edge is logged, not silently truncated.**
+  If a channel tab's listing was cut off at `--max-listed` and the oldest video
+  it did list is still inside the date window, videos may have been dropped —
+  logged as `CAP-HIT <channel> /<tab>: listing stopped at <N> with its oldest
+  video still in the window — raise --max-listed (0 = unlimited)`.
 - **Unaired premieres are skipped, not failed.** They have no captions until they
   air, and the next sweep picks them up.
 - **Re-uploads don't overwrite.** A video that slugs identically to an existing
