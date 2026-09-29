@@ -5,7 +5,7 @@ Usage:
     python channel_videos.py "<channel URL or @handle>" [--since-days N] [--limit N]
         [--stop-after-old N] [--probe-pace SECONDS] [--max-listed N]
 
-Output (stdout): a JSON array of ``{video_id, title, channel, url, tab, published?}``.
+Output (stdout): a JSON array of ``{video_id, title, channel, channel_id, url, tab, published?}``.
 
 Two details worth knowing before changing this:
 
@@ -85,30 +85,41 @@ def flat_list(url: str, limit: int | None = None) -> tuple[list[dict], str | Non
     """(videos, error). A failing tab is not on its own a problem — a channel
     with no shorts has no /shorts page — so the caller decides what it means.
 
-    ``channel`` comes from ``%(playlist_channel)s`` — the per-entry
-    ``%(channel)s`` is ``NA`` in a flat listing, but the top-level one is set
-    for every entry on the tab; yt-dlp's own "NA" placeholder becomes "".
+    ``channel`` comes from ``%(playlist_channel)s`` and ``channel_id`` from
+    ``%(playlist_channel_id)s`` — the per-entry ``%(channel)s``/``%(channel_id)s``
+    are ``NA`` in a flat listing, but the top-level ones are set for every
+    entry on the tab. ``channel_id`` is what lets ``window_channel`` build the
+    RSS URL straight from the listing, without a second yt-dlp call just to
+    resolve it. yt-dlp's own "NA" placeholder becomes "" for ``channel``,
+    ``channel_id`` and ``title`` alike — a short with no overlay metadata
+    prints a literal "NA" title, and the sweep passes listing titles to
+    ingest as hints, so an uncorrected "NA" would otherwise be saved as-is.
     The print template puts title last and this splits with ``maxsplit`` so a
     title containing a literal tab survives intact.
     """
     args = ["--flat-playlist", "--no-warnings"]
     if limit:
         args += ["--playlist-end", str(limit)]
-    args += ["--print", "%(id)s\t%(playlist_channel)s\t%(title)s", url]
+    args += ["--print", "%(id)s\t%(playlist_channel_id)s\t%(playlist_channel)s\t%(title)s", url]
     result = yt.run_ytdlp(args)
     if result.returncode != 0:
         return [], str(yt.ytdlp_failure(result))
 
     videos = []
     for line in result.stdout.strip().splitlines():
-        parts = line.split("\t", 2)
-        if len(parts) < 3:
+        parts = line.split("\t", 3)
+        if len(parts) < 4:
             continue
-        video_id, channel, title = (part.strip() for part in parts)
+        video_id, channel_id, channel, title = (part.strip() for part in parts)
         if channel == "NA":
             channel = ""
+        if channel_id == "NA":
+            channel_id = ""
+        if title == "NA":
+            title = ""
         if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
-            videos.append({"video_id": video_id, "title": title, "channel": channel})
+            videos.append({"video_id": video_id, "title": title, "channel": channel,
+                          "channel_id": channel_id})
     return videos, None
 
 
@@ -187,8 +198,12 @@ def probe_upload_date(video_id: str) -> str:
     transient, and apply_date_window must not read a throttled probe as "this
     video is an undatable premiere" — that would let the walk run unpaced
     through the whole channel history and silently return nothing.
+
+    ``--ignore-no-formats-error`` keeps the print running when YouTube
+    withholds formats for this video; without it, format selection fails
+    outright and every such probe would come back as undatable.
     """
-    result = yt.run_ytdlp(["--skip-download", "--no-warnings",
+    result = yt.run_ytdlp(["--skip-download", "--no-warnings", "--ignore-no-formats-error",
                           "--print", "%(upload_date)s",
                           f"https://www.youtube.com/watch?v={video_id}"])
     if result.returncode != 0:
@@ -202,7 +217,8 @@ def probe_upload_date(video_id: str) -> str:
     return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
 
 
-def apply_date_window(videos, cutoff, known_dates, stop_after_old=5, pace=0.0):
+def apply_date_window(videos, cutoff, known_dates, stop_after_old=5, pace=0.0, on_probe_error=None,
+                      on_tab_walked=None):
     """Keep videos published on/after ``cutoff``, dating the ones RSS missed.
 
     Stops probing after ``stop_after_old`` consecutive out-of-window videos, so a
@@ -219,17 +235,39 @@ def apply_date_window(videos, cutoff, known_dates, stop_after_old=5, pace=0.0):
     request per video, and a channel whose RSS lookup failed probes all of them,
     so an unpaced walk here can provoke the rate limit the ingest phase is built
     to survive.
+
+    A probe can also raise (rate-limited, network error). Without
+    ``on_probe_error`` that propagates, as before. With it, the whole walk
+    stops right there — no further probes on any tab — the exception goes to
+    ``on_probe_error`` instead of the caller, and whatever was kept so far is
+    returned, still newest first: a caller (a sweep) would rather log the
+    channel as cut short and move on than lose videos it already dated.
+
+    ``on_tab_walked(tab, stopped_early)`` fires once per tab once its group is
+    done, ``stopped_early`` true only when the ``stop_after_old`` run actually
+    fired. A caller deciding whether a capped listing might still be hiding
+    more in-window videos needs exactly this: reaching the cap while never
+    accumulating that run means the window's end was never confirmed, whether
+    the last entries were merely too few, or undatable and skipped outright.
     """
     kept, probed = [], False
 
-    for _tab, group in groupby(videos, key=lambda v: v.get("tab")):
+    for tab, group in groupby(videos, key=lambda v: v.get("tab")):
         consecutive_old = 0
+        stopped_early = False
         for video in group:
             published = known_dates.get(video["video_id"])
             if published is None:
                 if probed and pace:
                     time.sleep(pace)
-                published = probe_upload_date(video["video_id"])
+                try:
+                    published = probe_upload_date(video["video_id"])
+                except Exception as exc:
+                    if on_probe_error is None:
+                        raise
+                    on_probe_error(exc)
+                    kept.sort(key=lambda v: v["published"], reverse=True)
+                    return kept
                 probed = True
 
             if not published:
@@ -241,7 +279,11 @@ def apply_date_window(videos, cutoff, known_dates, stop_after_old=5, pace=0.0):
             else:
                 consecutive_old += 1
                 if consecutive_old >= stop_after_old:
+                    stopped_early = True
                     break  # done with this tab; the next one still gets walked
+
+        if on_tab_walked:
+            on_tab_walked(tab, stopped_early)
 
     kept.sort(key=lambda v: v["published"], reverse=True)
     return kept
@@ -249,7 +291,7 @@ def apply_date_window(videos, cutoff, known_dates, stop_after_old=5, pace=0.0):
 
 def window_channel(base_url, cutoff, stop_after_old=5, probe_pace=1.0,
                    limit_per_tab=DEFAULT_LISTING_CAP, on_tab_error=None,
-                   on_rss_miss=None, on_cap_hit=None) -> list[dict]:
+                   on_rss_miss=None, on_cap_hit=None, on_probe_error=None) -> list[dict]:
     """List a channel and keep only what falls inside the date window — the
     list -> RSS -> date-window sequence a sweep and ``main`` both need.
 
@@ -260,32 +302,40 @@ def window_channel(base_url, cutoff, stop_after_old=5, probe_pace=1.0,
     dating more expensive (every video gets probed individually), so it falls
     back to an empty dict instead, and ``on_rss_miss`` lets the caller say so.
 
-    ``on_cap_hit(tab, limit_per_tab)`` fires for a tab whose raw listing was
-    cut off at ``limit_per_tab`` *and* whose oldest listed video still made it
-    into the kept window — meaning videos beyond the cap could plausibly still
-    be in-window too, and were never even listed. A tab that came up short of
-    the cap on its own, or whose tail fell (or walked itself, via the early
-    stop above) out of the window, never fires it.
+    ``on_cap_hit(tab, limit_per_tab)`` fires for a tab whose raw listing (the
+    count of lines yt-dlp printed, before id filtering or cross-tab dedupe)
+    was cut off at ``limit_per_tab`` *and* whose walk never confirmed the
+    window had ended inside it — i.e. never saw a run of ``stop_after_old``
+    consecutive out-of-window videos — meaning videos beyond the cap could
+    plausibly still be in-window too, and were never even listed. A tab whose
+    raw listing came up short of the cap on its own, or whose early stop
+    above did fire, never fires it — including when the reason it never fired
+    is that the tab's tail is an undatable premiere or members-only video
+    rather than genuinely too few old videos.
     """
-    tab_listings = {}
+    tab_listings, stopped_early = {}, {}
 
-    def _note_tab(tab, raw_count, last_video_id):
-        tab_listings[tab] = (raw_count, last_video_id)
+    def _note_tab(tab, raw_count, _last_video_id):
+        tab_listings[tab] = raw_count
+
+    def _note_walked(tab, tab_stopped_early):
+        stopped_early[tab] = tab_stopped_early
 
     videos = list_channel(base_url, limit_per_tab=limit_per_tab, on_tab_error=on_tab_error,
                           on_tab_listed=_note_tab)
+    listed_channel_id = next((v["channel_id"] for v in videos if v.get("channel_id")), None)
     try:
-        known = rss_dates(channel_id(base_url))
+        known = rss_dates(listed_channel_id or channel_id(base_url))
     except Exception as exc:
         known = {}
         if on_rss_miss:
             on_rss_miss(exc)
-    kept = apply_date_window(videos, cutoff, known, stop_after_old, probe_pace)
+    kept = apply_date_window(videos, cutoff, known, stop_after_old, probe_pace,
+                             on_probe_error=on_probe_error, on_tab_walked=_note_walked)
 
     if on_cap_hit and limit_per_tab:
-        kept_ids = {video["video_id"] for video in kept}
-        for tab, (raw_count, last_video_id) in tab_listings.items():
-            if raw_count == limit_per_tab and last_video_id in kept_ids:
+        for tab, raw_count in tab_listings.items():
+            if raw_count == limit_per_tab and not stopped_early.get(tab, False):
                 on_cap_hit(tab, limit_per_tab)
 
     return kept
@@ -330,8 +380,8 @@ def main():
 
     def _report_cap_hit(tab, limit):
         print(json.dumps({
-            "warning": f"{tab} listing stopped at {limit} with its oldest video still in "
-                       "the window; raise --max-listed (0 = unlimited)",
+            "warning": f"{tab} listing stopped at {limit} without confirming the window had "
+                       "ended; raise --max-listed (0 = unlimited)",
         }), file=sys.stderr)
 
     try:
@@ -341,12 +391,11 @@ def main():
                                     limit_per_tab=limit_per_tab, on_cap_hit=_report_cap_hit)
         else:
             videos = list_channel(base, limit_per_tab=limit_per_tab)
+            if not videos:
+                print(json.dumps({"error": f"no videos listed for {base}"}), file=sys.stderr)
+                sys.exit(1)
     except RuntimeError as exc:
         print(json.dumps({"error": f"could not list {base}", "detail": str(exc)}), file=sys.stderr)
-        sys.exit(1)
-
-    if not videos:
-        print(json.dumps({"error": f"no videos listed for {base}"}), file=sys.stderr)
         sys.exit(1)
 
     if args.limit is not None:
