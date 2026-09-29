@@ -95,16 +95,17 @@ hand and rediscover them:
   nothing else failed, and stops the sweep from polling any further channel —
   logged as `BLOCKED while polling — <N> channel(s) not polled; rerun to
   resume` — though whatever that channel had already dated still gets
-  ingested. A rate-limited probe partway through a channel's walk keeps
-  whatever was dated before it hit and is logged the same way, with `—
-  keeping <N> video(s) already dated` appended.
+  ingested. A rate-limited probe partway through a channel's walk stops the
+  probing but keeps every video already dated, RSS-dated ones included, and
+  is logged the same way, with `— keeping <N> video(s) already dated`
+  appended. A walk cut short like that never logs `CAP-HIT`.
 - **A capped listing that never confirmed the window had ended is logged, not
   silently truncated.** If a tab's raw listing hit `--max-listed` and the walk
   never saw enough consecutive out-of-window videos to confirm the window had
   closed inside it — including an undatable tail, like a members-only or
   premiere video the walk can't date — videos beyond the cap may have been
-  dropped, logged as `CAP-HIT <channel> /<tab>: listing stopped at <N> with
-  its oldest video still in the window — raise --max-listed (0 = unlimited)`.
+  dropped, logged as `CAP-HIT <channel> /<tab>: listing stopped at <N> without
+  confirming the window had ended — raise --max-listed (0 = unlimited)`.
 - **Unaired premieres are skipped, not failed.** They have no captions until they
   air, and the next sweep picks them up.
 - **Re-uploads don't overwrite.** A video that slugs identically to an existing
