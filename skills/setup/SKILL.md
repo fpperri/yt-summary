@@ -21,6 +21,10 @@ Install the plugin's Python dependencies:
 
 ## Notes
 
+- **`ffmpeg` and `ffprobe`** are only needed by `yt-summary:ingest-slides`; every
+  other skill works without them. They are not `pip`-installable — point the
+  user at their platform's package manager or https://ffmpeg.org/download.html,
+  and confirm with `ffmpeg -version` / `ffprobe -version`.
 - **`youtube-transcript-api`** is the primary transcript source.
 - **`yt-dlp`** is the fallback transcript source and how title/channel/date and
   channel listings are resolved. `ingest` and `mass-ingest` need it;

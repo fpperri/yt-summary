@@ -45,7 +45,9 @@ caption endpoint's throttling; a hand-rolled fetch gets both wrong.
 ### 2. Report
 
 Tell the user the path written and the title. If they wanted analysis or study
-material, hand off to `yt-summary:digest` with that path.
+material, hand off to `yt-summary:digest` with that path. If the talk had slides
+worth keeping, `yt-summary:ingest-slides` can capture them beside the transcript
+first — the digest reads them too if they're there.
 
 ## Behavior worth knowing
 

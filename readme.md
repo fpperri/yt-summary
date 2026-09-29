@@ -8,6 +8,7 @@ material, and sweep whole channels for new uploads — from inside Claude Code.
 | Skill | What it does |
 |---|---|
 | `ingest` | Fetch one video's transcript and save it to a directory as `transcript.<slug>.md`. |
+| `ingest-slides` | Capture a talk's slides beside its ingested transcript, as images and `slides.<slug>.md`. |
 | `digest` | Turn a saved transcript (or any text) into an analysis and a study guide beside it. |
 | `mass-ingest` | Sweep a manifest of channels and ingest whatever is new. |
 | `transcript` | Print a video's full transcript with timestamps. |
@@ -41,6 +42,7 @@ pip install -r requirements.txt
 | `youtube-transcript-api` | primary transcript source |
 | `yt-dlp` | fallback transcript source; title/channel/date and channel listings |
 | `curl_cffi` *(optional)* | enables `yt-dlp --impersonate`, which helps past caption-endpoint throttling |
+| `ffmpeg` / `ffprobe` *(optional)* | not `pip`-installable; only needed by `ingest-slides`, for downloading and sampling video frames |
 
 ## Direct script usage
 
@@ -79,6 +81,21 @@ output/<channel>-<title>/transcript.<channel>-<title>.md
 with `source`, `video_id`, `title`, `channel`, `published`, `retrieved` and
 `fetched_via` frontmatter. `digest` adds `analysis.<slug>.md` and
 `study-guide.<slug>.md` alongside it.
+
+## Slides
+
+A transcript loses whatever was only on screen. `ingest-slides` pulls the slides
+out of an already-ingested video and writes them beside the transcript:
+
+```
+output/<channel>-<title>/slides/<mmss>-<name>.webp
+output/<channel>-<title>/slides.<channel>-<title>.md
+```
+
+It needs `ffmpeg` and `ffprobe` on PATH (see the dependencies table above) and
+walks fetch → detect → sample → extract → transcribe; run
+`digest` again afterward and it will cite the slides as `(slide mm:ss)` beside
+the transcript's own timestamps.
 
 ## Channel manifests
 
