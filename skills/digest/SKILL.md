@@ -49,7 +49,10 @@ Follow the two format specs exactly:
 3. **Write the analysis** following `references/analysis-format.md`.
 4. **Write the study guide** following `references/study-guide-format.md`, reading
    the analysis you just wrote as well as the source — the guide builds on it.
-5. **Report** the two paths you wrote, and anything about the source that limits
+5. **Self-check** — re-read every quote, timestamp, and `*claim*`/`*inference*`
+   mark in both artifacts against the source. Fix any mismatch before reporting;
+   a wrong timestamp or a spliced quote is a defect, not a rounding error.
+6. **Report** the two paths you wrote, and anything about the source that limits
    the result (truncated transcript, missing audio, heavy cross-talk).
 
 ## Conventions
@@ -60,6 +63,20 @@ Follow the two format specs exactly:
 - **Separate what is shown from what is asserted.** A source demonstrating a
   result and a source stating one are different things; the analysis format has a
   section for exactly this. Mark unbacked assertions `*claim*`.
+- **Never present your own inference as the source's content.** A structure,
+  grouping, count, principle list, or claim you assembled from the source is your
+  synthesis, not something the source states outright — mark it `*inference*` and
+  locate the nearest source passage it's drawn from. ("Four principles" is only
+  the source's if the source said four; otherwise it's yours to label.)
+- **Quotes are verbatim and contiguous.** Never splice separate passages into one
+  quote; trim only with an ellipsis. A quote's timestamp is the line it actually
+  comes from, not the surrounding passage's.
+- **Read slides alongside the transcript.** If `slides.<slug>.md` exists beside
+  the source (written by `yt-summary:ingest-slides`), read it too. Cite slide
+  content as `(slide mm:ss)` next to the transcript locator, prefer the slide's
+  spelling over garbled captions for names, and note where narration and slides
+  disagree. Sponsor bands, event logos, and other frame chrome are not slide
+  content or attribution.
 - **Faithful to this one source.** No cross-references to other material, no
   outside facts smuggled in. If the source is wrong, note that it is wrong — don't
   quietly correct it.

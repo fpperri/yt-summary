@@ -16,6 +16,7 @@ matters, what is supported, and what is merely asserted.
 ---
 source: <path or URL the analysis is based on>
 type: analysis
+tags: [tag-one, tag-two]
 generated: YYYY-MM-DD
 ---
 
@@ -44,6 +45,10 @@ The section that earns the file. Split what the source *shows* from what it
 
 If everything in the source is assertion, say so plainly. That is a finding.
 
+If slides accompany the source, this is where slide-backed claims and
+speech-only claims are told apart — a number or attribution shown on a slide
+reads differently than the same one only spoken.
+
 ## Terms
 Vocabulary the source introduces or uses in a specific way. Only terms a reader
 would otherwise have to look up.
@@ -65,6 +70,18 @@ Five to ten lowercase keywords, comma-separated. Subject matter, not format.
   `(§ Heading)` or a distinctive quoted phrase for prose.
 - **Mark unbacked assertions `*claim*`.** Applies in Key points too, not only in
   the table.
+- **Mark your own synthesis `*inference*`.** A grouping, count, or principle
+  list you assembled is not the source's content until the source states it —
+  say so and locate the passage it's drawn from, in Key points as much as
+  anywhere.
+- **Quotes are verbatim and contiguous.** Never splice separate passages into
+  one quote; trim only with an ellipsis, and give the timestamp of the line the
+  quote actually comes from.
+- **If `slides.<slug>.md` exists beside the source, read it.** Cite slide
+  content as `(slide mm:ss)` beside the transcript locator, prefer its spelling
+  of names over garbled captions, and note narration/slide disagreements in
+  Evidence vs assertion. Frame chrome (sponsor bands, event logos) isn't slide
+  content.
 - **In a vacuum.** No references to other sources, no outside knowledge. Tags are
   the only mechanism connecting this to anything else.
 - **Don't pad.** A thin source gets a short analysis. Empty sections are removed,
