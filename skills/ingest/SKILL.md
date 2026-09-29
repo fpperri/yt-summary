@@ -88,19 +88,28 @@ off on its own.
 
   | Path | Honors |
   |---|---|
-  | `youtube_transcript_api` | `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` |
+  | `youtube_transcript_api` | `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` |
   | `yt-dlp` metadata + channel listings | neither — needs `--compat-options no-certifi` |
-  | `yt-dlp` caption download (curl_cffi) | `CURL_CA_BUNDLE` |
+  | `yt-dlp` caption download (curl_cffi, only once `--impersonate` kicks in) | same as metadata; under `--impersonate`: `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` |
   | channel RSS feed, oembed metadata fallback | `SSL_CERT_FILE`; on Windows, the system certificate store |
 
-  The first three default to the **certifi** bundle, so appending the proxy's
-  root CA to it (`python -m certifi` prints the path) covers them in one step.
-  The fourth (plain `urllib`, used for RSS dates and the oembed fallback) checks
-  the OS's own certificate store instead, so it needs the CA installed there, or
-  `SSL_CERT_FILE` pointed at a bundle that includes it. The env-var route works
-  for the first three too; put `--compat-options no-certifi` in the yt-dlp user
-  config (`%APPDATA%\yt-dlp\config`, or `~/.config/yt-dlp/config`) so it applies
-  to every call this plugin makes.
+  `yt-dlp` picks its `requests`-based handler whenever `requests` is installed —
+  which `youtube_transcript_api` always pulls in — so its metadata, listing, and
+  (absent impersonation) caption calls all check the same certifi-loaded
+  context and ignore both env vars above; `curl_cffi` only takes over captions
+  once `yt-dlp` is impersonating a browser, and only then does it read them.
+
+  All three certifi-backed paths default to the same bundle, so appending the
+  proxy's root CA to it (`python -m certifi` prints the path) covers
+  `youtube_transcript_api` and both of `yt-dlp`'s own paths, impersonated or
+  not, in one step. The fourth (plain `urllib`, used for RSS dates and the
+  oembed fallback) checks the OS's own certificate store instead, so it needs
+  the CA installed there, or `SSL_CERT_FILE` pointed at a bundle that includes
+  it. The env vars above are a narrower alternative — they reach
+  `youtube_transcript_api` and an impersonated caption download, but not
+  `yt-dlp`'s own metadata/listing calls; `--compat-options no-certifi` in the
+  yt-dlp user config (`%APPDATA%\yt-dlp\config`, or `~/.config/yt-dlp/config`)
+  moves those to the OS store too.
 
   Never disable certificate verification (`--no-check-certificates`) to get past
   this — it turns the interception you are diagnosing into one you can't detect.

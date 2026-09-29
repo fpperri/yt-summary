@@ -107,19 +107,30 @@ locations are safe by default.
 
   | Path | Verifies against | Honors |
   |---|---|---|
-  | `youtube-transcript-api` | requests → certifi | `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` |
-  | `yt-dlp` metadata + channel listings | urllib → certifi | neither |
-  | `yt-dlp` caption download | curl_cffi → libcurl | `CURL_CA_BUNDLE` |
+  | `youtube-transcript-api` | requests → certifi | `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` |
+  | `yt-dlp` metadata + channel listings | requests → certifi | neither |
+  | `yt-dlp` caption download | same as metadata, unless `--impersonate` kicks in (only when a Chrome target is available) — then curl_cffi → libcurl | same as metadata; under `--impersonate`: `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` |
   | channel RSS feed, oembed metadata fallback | urllib → OS/stdlib trust store | `SSL_CERT_FILE`; on Windows, the system certificate store |
 
-  Appending your proxy's root CA to the **certifi** bundle — `python -m certifi`
-  prints its path — covers the first three. The fourth (plain `urllib`, used for
-  RSS dates and the oembed fallback) verifies against your OS's own certificate
-  store instead, so it needs the CA installed there, or `SSL_CERT_FILE` pointed
-  at a bundle that includes it. Alternatively, set all three env vars above, and
-  add `--compat-options no-certifi` to your yt-dlp user config
-  (`%APPDATA%\yt-dlp\config` on Windows, `~/.config/yt-dlp/config` elsewhere) so
-  its metadata calls fall back to the OS trust store too.
+  `yt-dlp` reaches for its own `requests`-based handler whenever the `requests`
+  package is installed — which `youtube-transcript-api` always pulls in as a
+  dependency — and falls back to plain `urllib` only if it isn't. Either way it
+  checks its own certifi-loaded context and ignores the two env vars above;
+  only `curl_cffi`, which takes over the caption download once `yt-dlp` is
+  impersonating a browser, reads them.
+
+  All three of the certifi-backed paths default to that same bundle, so
+  appending your proxy's root CA to it — `python -m certifi` prints its path —
+  covers `youtube-transcript-api` and both of `yt-dlp`'s own paths, impersonation
+  included, in one step. The fourth path (plain `urllib`, used for RSS dates and
+  the oembed fallback) verifies against your OS's own certificate store instead,
+  so it needs the CA installed there, or `SSL_CERT_FILE` pointed at a bundle
+  that includes it. `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` are a narrower
+  alternative — they reach `youtube-transcript-api` and an impersonated caption
+  download, but not `yt-dlp`'s own metadata/listing calls; for those, only the
+  certifi file itself moves the needle, or `--compat-options no-certifi` in
+  your yt-dlp user config (`%APPDATA%\yt-dlp\config` on Windows,
+  `~/.config/yt-dlp/config` elsewhere), which switches them to the OS store too.
 
   The plugin does no certificate handling of its own and never disables
   verification — don't reach for `--no-check-certificates`, which turns the

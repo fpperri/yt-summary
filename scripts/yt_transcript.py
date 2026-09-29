@@ -14,20 +14,26 @@ which one answered.
 Behind a TLS-inspecting proxy (corporate MITM, some AV suites) the paths below do
 not share a trust store, so a fix for one can leave the others failing:
 
-* ``youtube_transcript_api`` honors ``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE``.
-* ``yt-dlp``'s metadata and listing calls honor neither; they need
-  ``--compat-options no-certifi`` in the yt-dlp user config.
-* ``yt-dlp``'s caption download runs through curl_cffi and honors
-  ``CURL_CA_BUNDLE``.
+* ``youtube_transcript_api`` runs on plain ``requests`` and honors
+  ``REQUESTS_CA_BUNDLE`` / ``CURL_CA_BUNDLE``.
+* ``yt-dlp`` reaches for its own ``requests``-based handler whenever ``requests``
+  is installed — which ``youtube_transcript_api`` always pulls in — so its
+  metadata, listing, and (ordinarily) caption calls check yt-dlp's own
+  certifi-loaded context and honor neither env var; ``--compat-options
+  no-certifi`` in the yt-dlp user config is what moves them.
+* ``yt-dlp``'s caption download verifies exactly like the metadata calls above,
+  unless it is impersonating a browser (this script asks for that only when a
+  Chrome target is available), in which case it switches to curl_cffi and
+  honors ``REQUESTS_CA_BUNDLE`` / ``CURL_CA_BUNDLE``.
 
-Those three default to the certifi bundle, so appending the proxy's root CA to it
-covers them in one step. A fourth path — the plain ``urllib`` calls used
-elsewhere in this plugin for the channel RSS feed and the oembed metadata
-fallback — is not certifi-based: it uses the OS/stdlib trust store, which
-honors ``SSL_CERT_FILE`` and, on Windows, loads the system certificate store.
-The proxy's root CA needs to land there too (or in ``SSL_CERT_FILE``) for those
-calls to verify. This script does no certificate handling of its own and never
-disables verification.
+All three default to the certifi bundle, so appending the proxy's root CA to it
+covers them in one step regardless of which one is in play. A fourth path — the
+plain ``urllib`` calls used elsewhere in this plugin for the channel RSS feed
+and the oembed metadata fallback — is not certifi-based: it uses the OS/stdlib
+trust store, which honors ``SSL_CERT_FILE`` and, on Windows, loads the system
+certificate store. The proxy's root CA needs to land there too (or in
+``SSL_CERT_FILE``) for those calls to verify. This script does no certificate
+handling of its own and never disables verification.
 
 Usage:
     python yt_transcript.py <URL or VIDEO_ID> [--timestamps] [--delay SECONDS]
