@@ -35,8 +35,8 @@ prints:
   folder and rerun once metadata resolves (--force rewrites it in place).` —
   on stderr, when the video was saved but `yt-dlp` couldn't resolve its title
   or channel, so it landed under a video-id slug instead. Tell the user; once
-  metadata is resolvable, deleting the folder and rerunning (or `--force`)
-  gets it a proper slug.
+  metadata is resolvable, deleting the folder and rerunning gets it a proper
+  slug. `--force` does not: it rewrites the transcript in the existing folder.
 
 Do **not** hand-scrape the YouTube page or use WebFetch for transcripts. The
 script exists because raw fetching hits rolling-caption duplication and the
