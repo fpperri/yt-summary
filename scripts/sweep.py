@@ -2,7 +2,10 @@
 """Sweep a manifest of channels and ingest whatever is missing.
 
 Usage:
-    python sweep.py <manifest> [--output-dir DIR] [--since-days N] [--dry-run]
+    python sweep.py <manifest> [--output-dir DIR] [--since-days N] [--limit-per-channel N]
+                    [--pace SECONDS] [--max-block N] [--stop-after-old N]
+                    [--probe-pace SECONDS] [--max-listed N] [--dry-run]
+                    [--no-api] [--log FILE]
 
 The manifest is a plain text file you point at — one channel per line, ``#`` for
 comments. It is an argument rather than a file in this repo because a real
@@ -17,6 +20,11 @@ Rate limiting is the main hazard on a large sweep: YouTube throttles the caption
 endpoints per IP (``HTTP 429`` / ``IpBlocked``). Requests are paced, a throttled
 video is retried after an exponential backoff, and the run gives up only after a
 long run of consecutive blocks — so it can be left to grind rather than babysat.
+
+Exit code: 0 nothing to report, or a failure alongside at least one successful
+ingest; 1 a video or a whole channel failed and nothing was ingested; 2 the
+run itself, or a whole channel's walk, gave up rate-limited without
+ingesting anything.
 """
 import argparse
 import os
@@ -69,17 +77,21 @@ def log(message, logpath=None):
 
 def collect_candidates(channels, since_days, limit_per_channel=None, stop_after_old=5,
                        logpath=None, probe_pace=1.0, max_listed=cv.DEFAULT_LISTING_CAP):
-    """Poll each channel and return (candidates, channels_failed), newest tab order.
+    """Poll each channel and return (candidates, channels_failed, channels_blocked),
+    newest tab order.
 
     ``channels_failed`` counts channels that raised (list_channel exceptions
     propagate through ``window_channel``) rather than folding them silently
     into "nothing to do" — a manifest that only ever hits dead channels
-    should not look identical to a clean sweep (finding 6).
+    should not look identical to a clean sweep. A channel walk that raised
+    because YouTube rate-limited it is also counted in ``channels_blocked``,
+    so the caller can tell an IP block apart from a channel that is simply
+    gone.
     """
     import datetime
 
     cutoff = (datetime.date.today() - datetime.timedelta(days=since_days)).isoformat()
-    seen, candidates, channels_failed = set(), [], 0
+    seen, candidates, channels_failed, channels_blocked = set(), [], 0, 0
 
     for channel in channels:
         try:
@@ -88,10 +100,17 @@ def collect_candidates(channels, since_days, limit_per_channel=None, stop_after_
                 on_tab_error=lambda tab, err, c=channel: log(f"TAB-FAIL {c} /{tab}: {err}", logpath),
                 on_rss_miss=lambda exc, c=channel: log(
                     f"RSS-MISS {c}: {exc} — dating each video individually", logpath),
+                on_cap_hit=lambda tab, limit, c=channel: log(
+                    f"CAP-HIT {c} /{tab}: listing stopped at {limit} with its oldest video "
+                    "still in the window — raise --max-listed (0 = unlimited)", logpath),
             )
         except Exception as exc:
             channels_failed += 1
-            log(f"CHANNEL-FAIL {channel}: {exc}", logpath)
+            rate_limited = yt.failure_kind(exc) == "rate_limited"
+            if rate_limited:
+                channels_blocked += 1
+            suffix = " (rate limited)" if rate_limited else ""
+            log(f"CHANNEL-FAIL {channel}{suffix}: {exc}", logpath)
             continue
 
         if limit_per_channel is not None:
@@ -106,7 +125,7 @@ def collect_candidates(channels, since_days, limit_per_channel=None, stop_after_
             fresh += 1
         log(f"CHANNEL {channel}: {fresh} in window", logpath)
 
-    return candidates, channels_failed
+    return candidates, channels_failed, channels_blocked
 
 
 def sweep(manifest, output_dir=DEFAULT_OUTPUT_DIR, since_days=7, limit_per_channel=None,
@@ -116,10 +135,10 @@ def sweep(manifest, output_dir=DEFAULT_OUTPUT_DIR, since_days=7, limit_per_chann
     if not channels:
         log(f"no channels found in {manifest}", logpath)
         return {"ingested": 0, "skipped": 0, "failed": 0, "blocked": False,
-                "candidates": [], "channels_failed": 0}
+                "candidates": [], "channels_failed": 0, "channels_blocked": 0}
 
     log(f"sweeping {len(channels)} channel(s), last {since_days} day(s)", logpath)
-    candidates, channels_failed = collect_candidates(
+    candidates, channels_failed, channels_blocked = collect_candidates(
         channels, since_days, limit_per_channel, stop_after_old, logpath, probe_pace, max_listed)
 
     ingested_map = ingested_videos(output_dir)
@@ -131,7 +150,8 @@ def sweep(manifest, output_dir=DEFAULT_OUTPUT_DIR, since_days=7, limit_per_chann
         for candidate in todo:
             log(f"WOULD INGEST {candidate['video_id']} :: {candidate['title']}", logpath)
         return {"ingested": 0, "skipped": 0, "failed": 0, "blocked": False,
-                "candidates": todo, "channels_failed": channels_failed}
+                "candidates": todo, "channels_failed": channels_failed,
+                "channels_blocked": channels_blocked}
 
     ingested = skipped = failed = 0
     consecutive_blocks = 0
@@ -188,19 +208,28 @@ def sweep(manifest, output_dir=DEFAULT_OUTPUT_DIR, since_days=7, limit_per_chann
     log(f"sweep end: ingested={ingested} skipped={skipped} failed={failed}"
         f"{' (gave up: rate limited)' if blocked else ''}", logpath)
     return {"ingested": ingested, "skipped": skipped, "failed": failed,
-            "blocked": blocked, "candidates": todo, "channels_failed": channels_failed}
+            "blocked": blocked, "candidates": todo, "channels_failed": channels_failed,
+            "channels_blocked": channels_blocked}
 
 
 def exit_code(result) -> int:
-    # 2 = gave up rate-limited, so a scheduled wrapper can tell "the IP is
-    # blocked, nothing was done" apart from "nothing new to fetch" (0); 1
-    # flags a run that produced no ingests despite a video or a whole channel
-    # failing, so a wrapper doesn't have to parse the log to notice.
-    if result["blocked"]:
+    # 2 = gave up rate-limited (either the ingest loop itself or a whole
+    # channel walk), so a scheduled wrapper can tell "the IP is blocked,
+    # nothing was done" apart from "nothing new to fetch" (0); 1 flags a run
+    # that produced no ingests despite a video or a whole channel failing for
+    # some other reason, so a wrapper doesn't have to parse the log to notice.
+    if result["blocked"] or (result["channels_blocked"] and not result["ingested"]):
         return 2
     if (result["failed"] or result["channels_failed"]) and not result["ingested"]:
         return 1
     return 0
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be non-negative: {value}")
+    return parsed
 
 
 def main():
@@ -227,8 +256,9 @@ def main():
                         help="Stop date-probing a channel after this many consecutive old videos")
     parser.add_argument("--probe-pace", type=float, default=1.0,
                         help="Seconds between per-video date probes while polling (default: 1)")
-    parser.add_argument("--max-listed", type=int, default=cv.DEFAULT_LISTING_CAP,
-                        help=f"Cap videos listed per channel tab (default: {cv.DEFAULT_LISTING_CAP})")
+    parser.add_argument("--max-listed", type=_non_negative_int, default=cv.DEFAULT_LISTING_CAP,
+                        help="Cap videos listed per channel tab, 0 = unlimited "
+                             f"(default: {cv.DEFAULT_LISTING_CAP})")
     parser.add_argument("--dry-run", action="store_true",
                         help="List what would be ingested and exit")
     parser.add_argument("--no-api", action="store_true",

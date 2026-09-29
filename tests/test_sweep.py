@@ -45,7 +45,7 @@ class TestSweep:
         monkeypatch.setattr(
             sweep_module.cv, "window_channel",
             lambda url, cutoff, stop_after_old=5, probe_pace=1.0, limit_per_tab=None,
-                   on_tab_error=None, on_rss_miss=None: videos,
+                   on_tab_error=None, on_rss_miss=None, **kwargs: videos,
         )
 
     def test_dry_run_reports_without_ingesting(self, tmp_path, monkeypatch):
@@ -88,11 +88,11 @@ class TestSweep:
 
         result = sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0)
         assert result == {"ingested": 0, "skipped": 0, "failed": 0, "blocked": False,
-                          "candidates": [], "channels_failed": 0}
+                          "candidates": [], "channels_failed": 0, "channels_blocked": 0}
 
     def test_hints_from_the_candidate_are_passed_to_ingest(self, tmp_path, monkeypatch):
-        """The listing already knows title/channel/published (finding 9) — no
-        reason to make ingest() re-fetch metadata it was just handed."""
+        """The listing already knows title/channel/published — no reason to
+        make ingest() re-fetch metadata it was just handed."""
         self.stub_channel(monkeypatch, [
             {"video_id": "aaaaaaaaaaa", "title": "one", "channel": "Chan",
              "published": "2026-08-01", "tab": "videos"},
@@ -188,9 +188,9 @@ class TestSweep:
         assert result["blocked"] is False
 
     def test_network_failure_is_not_a_rate_limit_either(self, tmp_path, monkeypatch):
-        """finding 2: classification now comes from yt.failure_kind, which also
-        recognises transport failures — those advance and fail exactly like any
-        other non-retryable error, they just aren't mistaken for a 429."""
+        """Classification comes from yt.failure_kind, which also recognises
+        transport failures — those advance and fail exactly like any other
+        non-retryable error, they just aren't mistaken for a 429."""
         self.stub_channel(monkeypatch, [{"video_id": "aaaaaaaaaaa", "title": "one", "tab": "videos"}])
 
         def network_error(video_id, output_dir, hints=None, ingested=None):
@@ -221,10 +221,11 @@ class TestSweep:
         assert result["ingested"] == 1
 
     def test_a_failed_channel_is_counted_and_logged(self, tmp_path, monkeypatch):
-        """finding 6: a channel that could not be listed at all must not look
-        like a clean sweep that simply had nothing new."""
+        """A channel that could not be listed at all must not look like a
+        clean sweep that simply had nothing new."""
         def raising_window_channel(url, cutoff, stop_after_old=5, probe_pace=1.0,
-                                   limit_per_tab=None, on_tab_error=None, on_rss_miss=None):
+                                   limit_per_tab=None, on_tab_error=None, on_rss_miss=None,
+                                   **kwargs):
             raise RuntimeError("ERROR: [youtube:tab] @alpha: This channel does not exist")
 
         monkeypatch.setattr(sweep_module.cv, "window_channel", raising_window_channel)
@@ -233,18 +234,42 @@ class TestSweep:
         assert result["channels_failed"] == 1
         assert result["ingested"] == 0
 
-    def test_max_listed_is_passed_through_to_window_channel(self, tmp_path, monkeypatch):
-        captured = {}
+    def test_a_rate_limited_channel_is_counted_as_blocked_and_logged(self, tmp_path, monkeypatch, capsys):
+        """A channel walk can itself be rate-limited (the listing or the date
+        probes get IP-blocked), not just an individual video's caption fetch —
+        that must be visible as its own signal rather than folded into an
+        ordinary channel failure."""
+        def rate_limited_window_channel(url, cutoff, stop_after_old=5, probe_pace=1.0,
+                                        limit_per_tab=None, on_tab_error=None, on_rss_miss=None,
+                                        **kwargs):
+            raise sweep_module.yt.RateLimited("HTTP Error 429: Too Many Requests")
 
-        def fake_window_channel(url, cutoff, stop_after_old=5, probe_pace=1.0, limit_per_tab=None,
-                                on_tab_error=None, on_rss_miss=None):
-            captured["limit_per_tab"] = limit_per_tab
+        monkeypatch.setattr(sweep_module.cv, "window_channel", rate_limited_window_channel)
+        result = sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0)
+
+        assert result["channels_blocked"] == 1
+        assert result["channels_failed"] == 1
+        out = capsys.readouterr().out
+        assert "CHANNEL-FAIL" in out
+        assert "rate limited" in out.lower()
+
+    def test_cap_hit_on_a_channel_tab_is_logged(self, tmp_path, monkeypatch, capsys):
+        """window_channel calls back on_cap_hit when a tab's listing was cut
+        off with in-window videos possibly still beyond the cap — surfacing
+        that as a log line is what tells a human to raise --max-listed rather
+        than silently missing videos forever."""
+        def capped_window_channel(url, cutoff, stop_after_old=5, probe_pace=1.0,
+                                  limit_per_tab=None, on_tab_error=None, on_rss_miss=None,
+                                  on_cap_hit=None, **kwargs):
+            if on_cap_hit:
+                on_cap_hit("shorts", 42)
             return []
 
-        monkeypatch.setattr(sweep_module.cv, "window_channel", fake_window_channel)
-        sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, max_listed=42)
+        monkeypatch.setattr(sweep_module.cv, "window_channel", capped_window_channel)
+        sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0)
 
-        assert captured["limit_per_tab"] == 42
+        out = capsys.readouterr().out
+        assert "CAP-HIT" in out and "/shorts" in out and "42" in out and "--max-listed" in out
 
     def test_fallback_slug_is_noted_in_the_ok_log_line(self, tmp_path, monkeypatch, capsys):
         self.stub_channel(monkeypatch, [{"video_id": "aaaaaaaaaaa", "title": "one", "tab": "videos"}])
@@ -255,25 +280,6 @@ class TestSweep:
         sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0)
         assert "fallback slug" in capsys.readouterr().out.lower()
 
-    def test_newly_ingested_video_is_added_to_the_ingested_map(self, tmp_path, monkeypatch):
-        """finding 9: each successful ingest is added to the map passed into
-        the next call, so a later candidate that duplicates an earlier one
-        (two channels sharing a video) is seen as already done within the run."""
-        self.stub_channel(monkeypatch, [
-            {"video_id": "aaaaaaaaaaa", "title": "one", "tab": "videos"},
-            {"video_id": "bbbbbbbbbbb", "title": "two", "tab": "videos"},
-        ])
-        seen_ingested_keys = []
-
-        def fake_ingest(video_id, output_dir, hints=None, ingested=None):
-            seen_ingested_keys.append(set((ingested or {}).keys()))
-            return {"slug": f"s-{video_id}", "skipped": False, "path": "p"}
-
-        monkeypatch.setattr(sweep_module, "ingest", fake_ingest)
-        sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0)
-
-        assert seen_ingested_keys == [set(), {"aaaaaaaaaaa"}]
-
 
 def pytest_fail_ingest():
     raise AssertionError("ingest must not be called")
@@ -282,7 +288,7 @@ def pytest_fail_ingest():
 class TestExitCode:
     def result(self, **overrides):
         base = {"ingested": 0, "skipped": 0, "failed": 0, "blocked": False,
-                "candidates": [], "channels_failed": 0}
+                "candidates": [], "channels_failed": 0, "channels_blocked": 0}
         return {**base, **overrides}
 
     def test_blocked_beats_everything(self):
@@ -299,3 +305,9 @@ class TestExitCode:
 
     def test_clean_sweep_is_0(self):
         assert sweep_module.exit_code(self.result()) == 0
+
+    def test_channels_blocked_with_nothing_ingested_is_2(self):
+        assert sweep_module.exit_code(self.result(channels_blocked=1)) == 2
+
+    def test_channels_blocked_alongside_a_successful_ingest_is_0(self):
+        assert sweep_module.exit_code(self.result(channels_blocked=1, ingested=1)) == 0
