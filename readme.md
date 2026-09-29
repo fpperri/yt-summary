@@ -61,13 +61,14 @@ python scripts/sweep.py my-channels.txt --output-dir output --since-days 7 --dry
 python scripts/sweep.py my-channels.txt --output-dir output --since-days 7
 ```
 
-`sweep.py` exits `0` on a clean run, `1` if a video or a whole channel failed and
-nothing was ingested, `2` if the run — or a whole channel's walk — gave up
-rate-limited without ingesting anything; see the comment above `exit_code` in
-`scripts/sweep.py` for the exact rule. Both `sweep.py` and `channel_videos.py`
-take `--max-listed` to cap how many videos are listed per channel tab (`0` =
-unlimited; default 100 once a date window is in play; see `scripts/sweep.py
---help` / `scripts/channel_videos.py --help`).
+`sweep.py` exits `0` on a clean run (including one with nothing new), `1` if a
+video or a whole channel failed and nothing was ingested, `2` if the run — or a
+whole channel's walk — got cut short by rate limiting and work remains, whether
+or not videos were ingested first; rerun later to resume. See the comment above
+`exit_code` in `scripts/sweep.py` for the exact rule. Both `sweep.py` and
+`channel_videos.py` take `--max-listed` to cap how many videos are listed per
+channel tab (`0` = unlimited; default 100 once a date window is in play; see
+`scripts/sweep.py --help` / `scripts/channel_videos.py --help`).
 
 An ingested video lands as:
 
@@ -92,7 +93,9 @@ locations are safe by default.
 
 - **Resumable everywhere.** Ingests are keyed on the video id recorded in the
   transcript frontmatter, so re-running an ingest or interrupting a sweep costs
-  nothing. `--force` refetches deliberately.
+  nothing. `--force` refetches deliberately, rewriting the existing transcript
+  file in place (found by video id, so a renamed folder still gets its one
+  file overwritten) and keeping prior metadata if the refetch can't resolve it.
 - **Rate limits.** YouTube throttles caption endpoints per IP (`429` /
   `IpBlocked`). `sweep.py` paces requests and backs off rather than hammering.
   If you're already blocked, wait it out — retrying keeps the block hot.

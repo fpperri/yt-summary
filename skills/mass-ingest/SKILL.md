@@ -61,9 +61,10 @@ videos are listed per channel tab (default 100, `0` = unlimited).
 ### 3. Report and hand off
 
 Report ingested / skipped / failed counts and anything worth a retry. Exit code
-is `0` on a clean run, `1` if a video or a whole channel failed and nothing was
-ingested, `2` if the run — or a whole channel's walk — gave up rate-limited
-without ingesting anything.
+is `0` on a clean run (including nothing new), `1` if a video or a whole channel
+failed and nothing was ingested, `2` if the run — or a whole channel's walk —
+got cut short by rate limiting and work remains, whether or not videos were
+ingested first; rerun later to resume.
 
 To analyze what came in, run `yt-summary:digest` over the new transcripts —
 those are independent per video and can be fanned out in parallel.
@@ -87,14 +88,23 @@ hand and rediscover them:
   long-running channel costs a handful of probes rather than one per video.
 - **Rate limits are expected.** A throttled video is retried after an exponential
   backoff (up to ~1h) rather than abandoned; the run stops only after
-  `--max-block` consecutive blocks. A channel walk that gives up rate-limited
-  is logged as `CHANNEL-FAIL <url> (rate limited): <msg>` and counted so a
-  rate-limited run can still exit `2` even though nothing else failed.
-- **A capped listing near the window edge is logged, not silently truncated.**
-  If a channel tab's listing was cut off at `--max-listed` and the oldest video
-  it did list is still inside the date window, videos may have been dropped —
-  logged as `CAP-HIT <channel> /<tab>: listing stopped at <N> with its oldest
-  video still in the window — raise --max-listed (0 = unlimited)`.
+  `--max-block` consecutive blocks. A channel walk that hits rate limiting —
+  whether the whole walk raises, or one tab does while the other still lists
+  fine — is logged as `CHANNEL-FAIL <url> (rate limited): <msg>` or
+  `TAB-FAIL <url> /<tab>: <msg>`, counted toward a blocked exit even if
+  nothing else failed, and stops the sweep from polling any further channel —
+  logged as `BLOCKED while polling — <N> channel(s) not polled; rerun to
+  resume` — though whatever that channel had already dated still gets
+  ingested. A rate-limited probe partway through a channel's walk keeps
+  whatever was dated before it hit and is logged the same way, with `—
+  keeping <N> video(s) already dated` appended.
+- **A capped listing that never confirmed the window had ended is logged, not
+  silently truncated.** If a tab's raw listing hit `--max-listed` and the walk
+  never saw enough consecutive out-of-window videos to confirm the window had
+  closed inside it — including an undatable tail, like a members-only or
+  premiere video the walk can't date — videos beyond the cap may have been
+  dropped, logged as `CAP-HIT <channel> /<tab>: listing stopped at <N> with
+  its oldest video still in the window — raise --max-listed (0 = unlimited)`.
 - **Unaired premieres are skipped, not failed.** They have no captions until they
   air, and the next sweep picks them up.
 - **Re-uploads don't overwrite.** A video that slugs identically to an existing

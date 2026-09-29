@@ -52,6 +52,12 @@ material, hand off to `yt-summary:digest` with that path.
 - **Resumable.** A video already ingested under the output directory is skipped,
   matched on the video id in the transcript's frontmatter rather than on folder
   names. Re-running costs nothing. Pass `--force` to refetch deliberately.
+- **`--force` doesn't lose what's already there.** It rewrites the existing
+  transcript file in place — found by the video id in its frontmatter, so a
+  folder the user renamed since first ingest still gets its one file
+  overwritten instead of a second one alongside it. If the refetch can't
+  resolve title/channel/date, the prior metadata is kept rather than blanked
+  out.
 - **Two transcript sources.** `youtube_transcript_api` first, falling back to
   `yt-dlp` auto-subs. The frontmatter's `fetched_via` records which answered.
 - **Slug collisions don't overwrite.** If a different video already owns the slug
