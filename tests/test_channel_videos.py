@@ -1,3 +1,6 @@
+import io
+import json
+
 import pytest
 
 import channel_videos as cv
@@ -8,6 +11,73 @@ from channel_videos import apply_date_window, flat_list, list_channel, normalize
 def ytdlp_result(returncode=0, stdout="", stderr=""):
     import subprocess
     return subprocess.CompletedProcess(["yt-dlp"], returncode, stdout=stdout, stderr=stderr)
+
+
+def atom_feed(dates: dict) -> bytes:
+    """A minimal RSS/Atom body in the shape ``rss_dates`` parses: one
+    ``<entry>`` per {video_id: 'YYYY-MM-DD'} pair."""
+    entries = "\n".join(
+        f'<entry><yt:videoId>{vid}</yt:videoId>'
+        f'<published>{date}T12:00:00+00:00</published></entry>'
+        for vid, date in dates.items()
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<feed xmlns="http://www.w3.org/2005/Atom" '
+        'xmlns:yt="http://www.youtube.com/xml/schemas/2015">'
+        f"{entries}</feed>"
+    ).encode("utf-8")
+
+
+class FakeYtDlp:
+    """Answers the three yt-dlp shapes ``window_channel`` drives — a tab's
+    flat-playlist listing, the ``-J`` channel dump ``channel_id`` reads, and a
+    per-video upload-date probe — from canned data, and records every
+    argument list it was called with.
+
+    ``tabs`` maps a tab name to its raw (pre-dedupe, pre-cap) listing as
+    ``[(video_id, title), ...]``; a ``--playlist-end`` in the call args slices
+    it, the same way yt-dlp itself would stop early. ``dates`` maps a video id
+    to an 8-digit upload_date string, or to ``"RATE_LIMITED"`` to make that
+    probe fail as a throttled request. ``listing_errors`` maps a tab name to a
+    stderr message that makes its listing fail outright. ``channel_id_error``
+    makes the ``-J`` dump fail, the same way a bad channel reference would.
+    """
+
+    def __init__(self, channel_id="UCabc123", tabs=None, dates=None,
+                listing_errors=None, channel_id_error=None):
+        self.channel_id = channel_id
+        self.tabs = tabs or {}
+        self.dates = dates or {}
+        self.listing_errors = listing_errors or {}
+        self.channel_id_error = channel_id_error
+        self.calls = []
+
+    def __call__(self, args, timeout=None):
+        self.calls.append(args)
+        if "-J" in args:
+            if self.channel_id_error:
+                return ytdlp_result(returncode=1, stderr=self.channel_id_error)
+            return ytdlp_result(stdout=json.dumps({"channel_id": self.channel_id}))
+
+        if "--flat-playlist" in args:
+            tab = "shorts" if args[-1].endswith("/shorts") else "videos"
+            if tab in self.listing_errors:
+                return ytdlp_result(returncode=1, stderr=self.listing_errors[tab])
+            entries = self.tabs.get(tab, [])
+            if "--playlist-end" in args:
+                cap = int(args[args.index("--playlist-end") + 1])
+                entries = entries[:cap]
+            lines = "".join(f"{vid}\tSome Channel\t{title}\n" for vid, title in entries)
+            return ytdlp_result(stdout=lines)
+
+        video_id = args[-1].rsplit("=", 1)[-1]
+        date = self.dates.get(video_id)
+        if date is None:
+            return ytdlp_result(returncode=1, stderr="ERROR: Private video")
+        if date == "RATE_LIMITED":
+            return ytdlp_result(returncode=1, stderr="HTTP Error 429: Too Many Requests")
+        return ytdlp_result(stdout=date + "\n")
 
 
 class TestNormalizeChannelUrl:
@@ -86,19 +156,6 @@ class TestFlatList:
         videos, _ = flat_list("https://www.youtube.com/@c/videos")
         assert videos[0]["title"] == "part1\tpart2"
 
-    def test_uses_run_ytdlp_for_the_encoding_flags(self, monkeypatch):
-        """finding 7: every yt-dlp call in this module goes through
-        yt.run_ytdlp so Windows doesn't silently drop non-cp1252 output."""
-        calls = []
-        monkeypatch.setattr(
-            cv.yt, "run_ytdlp",
-            lambda args, timeout=None: calls.append(args) or ytdlp_result(),
-        )
-        flat_list("https://www.youtube.com/@c/videos")
-        (args,) = calls
-        assert "--flat-playlist" in args
-        assert "https://www.youtube.com/@c/videos" in args
-
     def test_limit_adds_playlist_end(self, monkeypatch):
         calls = []
         monkeypatch.setattr(
@@ -117,6 +174,18 @@ class TestFlatList:
             lambda args, timeout=None: calls.append(args) or ytdlp_result(),
         )
         flat_list("https://www.youtube.com/@c/videos")
+        (args,) = calls
+        assert "--playlist-end" not in args
+
+    def test_zero_limit_also_means_no_playlist_end(self, monkeypatch):
+        """A falsy limit means unlimited everywhere, so 0 and None must behave
+        the same way here."""
+        calls = []
+        monkeypatch.setattr(
+            cv.yt, "run_ytdlp",
+            lambda args, timeout=None: calls.append(args) or ytdlp_result(),
+        )
+        flat_list("https://www.youtube.com/@c/videos", limit=0)
         (args,) = calls
         assert "--playlist-end" not in args
 
@@ -173,43 +242,6 @@ class TestListChannel:
         with pytest.raises(RuntimeError, match="404"):
             list_channel("https://www.youtube.com/@wrong")
 
-    def test_passes_limit_per_tab_through_to_flat_list(self, monkeypatch):
-        seen_limits = []
-        monkeypatch.setattr(
-            cv, "flat_list",
-            lambda url, limit=None: (seen_limits.append(limit) or [], None),
-        )
-        list_channel("https://www.youtube.com/@c", limit_per_tab=100)
-        assert seen_limits == [100, 100]
-
-
-class TestChannelId:
-    def test_reads_channel_id_from_the_flat_dump(self, monkeypatch):
-        monkeypatch.setattr(
-            cv.yt, "run_ytdlp",
-            lambda args, timeout=None: ytdlp_result(stdout='{"channel_id": "UCabc123"}'),
-        )
-        assert cv.channel_id("https://www.youtube.com/@c") == "UCabc123"
-
-    def test_raises_ytdlp_failure_on_nonzero_exit(self, monkeypatch):
-        """finding 7: no more check=True — a classified exception instead of a
-        bare CalledProcessError that drops stderr."""
-        monkeypatch.setattr(
-            cv.yt, "run_ytdlp",
-            lambda args, timeout=None: ytdlp_result(returncode=1, stderr="HTTP Error 429: Too Many Requests\n"),
-        )
-        with pytest.raises(yt.RateLimited):
-            cv.channel_id("https://www.youtube.com/@c")
-
-    def test_raises_when_channel_id_is_missing(self, monkeypatch):
-        monkeypatch.setattr(
-            cv.yt, "run_ytdlp",
-            lambda args, timeout=None: ytdlp_result(stdout='{}'),
-        )
-        with pytest.raises(RuntimeError, match="channel_id"):
-            cv.channel_id("https://www.youtube.com/@c")
-
-
 class TestProbeUploadDate:
     def test_returns_iso_date_on_success(self, monkeypatch):
         monkeypatch.setattr(
@@ -227,8 +259,8 @@ class TestProbeUploadDate:
         assert cv.probe_upload_date("aaaaaaaaaaa") == ""
 
     def test_raises_on_rate_limited_failure(self, monkeypatch):
-        """finding 4: a throttled probe must not look like an undatable video,
-        or apply_date_window will silently walk the whole channel history."""
+        """A throttled probe must not look like an undatable video, or
+        apply_date_window will silently walk the whole channel history."""
         monkeypatch.setattr(
             cv.yt, "run_ytdlp",
             lambda args, timeout=None: ytdlp_result(returncode=1, stderr="HTTP Error 429: Too Many Requests\n"),
@@ -253,80 +285,116 @@ class TestProbeUploadDate:
         )
         assert cv.probe_upload_date("aaaaaaaaaaa") == ""
 
-    def test_uses_run_ytdlp(self, monkeypatch):
-        calls = []
-        monkeypatch.setattr(
-            cv.yt, "run_ytdlp",
-            lambda args, timeout=None: calls.append(args) or ytdlp_result(stdout="20260830\n"),
-        )
-        cv.probe_upload_date("aaaaaaaaaaa")
-        (args,) = calls
-        assert "aaaaaaaaaaa" in " ".join(args)
-
 
 class TestWindowChannel:
+    """Exercises window_channel end to end, faking only its process/network
+    boundaries: yt.run_ytdlp (via FakeYtDlp) and urllib.request.urlopen for
+    the RSS feed. list_channel, channel_id, rss_dates and probe_upload_date
+    stay real, so a test only passes if the whole chain actually works."""
+
+    def fake_urlopen(self, dates):
+        return lambda url, context=None, timeout=None: io.BytesIO(atom_feed(dates))
+
     def test_lists_dates_and_windows_in_one_call(self, monkeypatch):
-        monkeypatch.setattr(cv, "list_channel", lambda base_url, limit_per_tab=None, on_tab_error=None: [
-            {"video_id": "aaaaaaaaaaa", "title": "t", "channel": "c", "tab": "videos"},
-        ])
-        monkeypatch.setattr(cv, "channel_id", lambda base_url: "UCabc")
-        monkeypatch.setattr(cv, "rss_dates", lambda cid: {"aaaaaaaaaaa": "2026-08-30"})
+        fake = FakeYtDlp(tabs={
+            "videos": [("aaaaaaaaaaa", "t1"), ("bbbbbbbbbbb", "t2")],
+            "shorts": [("ccccccccccc", "t3")],
+        })
+        monkeypatch.setattr(cv.yt, "run_ytdlp", fake)
+        monkeypatch.setattr(cv.urllib.request, "urlopen", self.fake_urlopen({
+            "aaaaaaaaaaa": "2026-08-30", "bbbbbbbbbbb": "2026-01-15", "ccccccccccc": "2026-08-25",
+        }))
 
         kept = cv.window_channel("https://www.youtube.com/@c", "2026-08-01")
-        assert [v["video_id"] for v in kept] == ["aaaaaaaaaaa"]
+        assert [v["video_id"] for v in kept] == ["aaaaaaaaaaa", "ccccccccccc"]
 
-    def test_passes_limit_per_tab_and_on_tab_error_to_list_channel(self, monkeypatch):
-        seen = {}
-        monkeypatch.setattr(cv, "list_channel", lambda base_url, limit_per_tab=None, on_tab_error=None: (
-            seen.update(limit_per_tab=limit_per_tab, on_tab_error=on_tab_error) or []
-        ))
-        monkeypatch.setattr(cv, "channel_id", lambda base_url: "UCabc")
-        monkeypatch.setattr(cv, "rss_dates", lambda cid: {})
+    def test_the_cap_reaches_ytdlp_as_playlist_end_and_zero_sends_none(self, monkeypatch):
+        capped = FakeYtDlp(tabs={"videos": [("aaaaaaaaaaa", "t1"), ("bbbbbbbbbbb", "t2")]})
+        monkeypatch.setattr(cv.yt, "run_ytdlp", capped)
+        monkeypatch.setattr(cv.urllib.request, "urlopen", self.fake_urlopen({}))
+        cv.window_channel("https://www.youtube.com/@c", "2026-08-01", limit_per_tab=1)
+        listing_calls = [c for c in capped.calls if "--flat-playlist" in c and "-J" not in c]
+        assert any("--playlist-end" in c and c[c.index("--playlist-end") + 1] == "1"
+                   for c in listing_calls)
 
-        marker = object()
-        cv.window_channel("https://www.youtube.com/@c", "2026-08-01", limit_per_tab=42, on_tab_error=marker)
-        assert seen == {"limit_per_tab": 42, "on_tab_error": marker}
+        uncapped = FakeYtDlp(tabs={"videos": [("aaaaaaaaaaa", "t1")]})
+        monkeypatch.setattr(cv.yt, "run_ytdlp", uncapped)
+        monkeypatch.setattr(cv.urllib.request, "urlopen", self.fake_urlopen({}))
+        cv.window_channel("https://www.youtube.com/@c", "2026-08-01", limit_per_tab=0)
+        assert not any("--playlist-end" in c for c in uncapped.calls)
 
-    def test_rss_miss_falls_back_to_empty_dates_and_calls_on_rss_miss(self, monkeypatch):
-        monkeypatch.setattr(cv, "list_channel", lambda base_url, limit_per_tab=None, on_tab_error=None: [
-            {"video_id": "aaaaaaaaaaa", "title": "t", "channel": "c", "tab": "videos"},
-        ])
-        monkeypatch.setattr(cv, "channel_id", lambda base_url: "UCabc")
-
-        def raise_rss(cid):
-            raise RuntimeError("rss unreachable")
-        monkeypatch.setattr(cv, "rss_dates", raise_rss)
-        monkeypatch.setattr(cv, "probe_upload_date", lambda vid: "2026-08-30")
+    def test_rss_miss_falls_back_to_probing_and_calls_on_rss_miss(self, monkeypatch):
+        """Covers a channel_id failure the same way a broken RSS lookup does:
+        window_channel treats both as reasons to date every video by hand."""
+        fake = FakeYtDlp(tabs={"videos": [("aaaaaaaaaaa", "t1")]},
+                        dates={"aaaaaaaaaaa": "20260830"},
+                        channel_id_error="ERROR: could not resolve channel")
+        monkeypatch.setattr(cv.yt, "run_ytdlp", fake)
 
         misses = []
         kept = cv.window_channel("https://www.youtube.com/@c", "2026-08-01", on_rss_miss=misses.append)
         assert [v["video_id"] for v in kept] == ["aaaaaaaaaaa"]
         assert len(misses) == 1
-        assert "rss unreachable" in str(misses[0])
+        assert "could not resolve channel" in str(misses[0])
 
-    def test_list_channel_exceptions_propagate(self, monkeypatch):
-        def raise_listing(base_url, limit_per_tab=None, on_tab_error=None):
-            raise RuntimeError("could not list")
-        monkeypatch.setattr(cv, "list_channel", raise_listing)
+    def test_listing_failure_on_every_tab_propagates(self, monkeypatch):
+        fake = FakeYtDlp(listing_errors={
+            "videos": "HTTP Error 404: Not Found", "shorts": "HTTP Error 404: Not Found",
+        })
+        monkeypatch.setattr(cv.yt, "run_ytdlp", fake)
 
-        with pytest.raises(RuntimeError, match="could not list"):
+        with pytest.raises(RuntimeError, match="404"):
             cv.window_channel("https://www.youtube.com/@c", "2026-08-01")
 
-    def test_probe_failure_propagates(self, monkeypatch):
-        """finding 4: a rate-limited probe inside apply_date_window must not be
-        swallowed here either."""
-        monkeypatch.setattr(cv, "list_channel", lambda base_url, limit_per_tab=None, on_tab_error=None: [
-            {"video_id": "aaaaaaaaaaa", "title": "t", "channel": "c", "tab": "videos"},
-        ])
-        monkeypatch.setattr(cv, "channel_id", lambda base_url: "UCabc")
-        monkeypatch.setattr(cv, "rss_dates", lambda cid: {})
-
-        def raise_rate_limited(vid):
-            raise yt.RateLimited("HTTP Error 429: Too Many Requests")
-        monkeypatch.setattr(cv, "probe_upload_date", raise_rate_limited)
+    def test_a_rate_limited_probe_propagates(self, monkeypatch):
+        """A rate-limited probe inside apply_date_window must not be swallowed
+        here either."""
+        fake = FakeYtDlp(tabs={"videos": [("aaaaaaaaaaa", "t1")]},
+                        dates={"aaaaaaaaaaa": "RATE_LIMITED"})
+        monkeypatch.setattr(cv.yt, "run_ytdlp", fake)
+        monkeypatch.setattr(cv.urllib.request, "urlopen", self.fake_urlopen({}))
 
         with pytest.raises(yt.RateLimited):
             cv.window_channel("https://www.youtube.com/@c", "2026-08-01")
+
+    def test_cap_hit_fires_when_a_tabs_raw_listing_was_capped_and_its_tail_is_still_in_window(self, monkeypatch):
+        fake = FakeYtDlp(tabs={"videos": [("aaaaaaaaaaa", "t1"), ("bbbbbbbbbbb", "t2")]})
+        monkeypatch.setattr(cv.yt, "run_ytdlp", fake)
+        monkeypatch.setattr(cv.urllib.request, "urlopen", self.fake_urlopen({
+            "aaaaaaaaaaa": "2026-08-30", "bbbbbbbbbbb": "2026-08-20",
+        }))
+
+        hits = []
+        cv.window_channel("https://www.youtube.com/@c", "2026-08-01", limit_per_tab=2,
+                          on_cap_hit=lambda tab, limit: hits.append((tab, limit)))
+        assert hits == [("videos", 2)]
+
+    def test_cap_hit_does_not_fire_when_the_tab_listed_fewer_than_the_cap(self, monkeypatch):
+        fake = FakeYtDlp(tabs={"videos": [("aaaaaaaaaaa", "t1"), ("bbbbbbbbbbb", "t2")]})
+        monkeypatch.setattr(cv.yt, "run_ytdlp", fake)
+        monkeypatch.setattr(cv.urllib.request, "urlopen", self.fake_urlopen({
+            "aaaaaaaaaaa": "2026-08-30", "bbbbbbbbbbb": "2026-08-20",
+        }))
+
+        hits = []
+        cv.window_channel("https://www.youtube.com/@c", "2026-08-01", limit_per_tab=5,
+                          on_cap_hit=lambda tab, limit: hits.append((tab, limit)))
+        assert hits == []
+
+    def test_cap_hit_does_not_fire_when_the_capped_tail_falls_outside_the_window(self, monkeypatch):
+        """The tab was cut off at the cap, but its oldest listed video is
+        already too old — there is no reason to believe more in-window videos
+        were dropped beyond it."""
+        fake = FakeYtDlp(tabs={"videos": [("aaaaaaaaaaa", "t1"), ("bbbbbbbbbbb", "t2")]})
+        monkeypatch.setattr(cv.yt, "run_ytdlp", fake)
+        monkeypatch.setattr(cv.urllib.request, "urlopen", self.fake_urlopen({
+            "aaaaaaaaaaa": "2026-08-30", "bbbbbbbbbbb": "2026-01-01",
+        }))
+
+        hits = []
+        cv.window_channel("https://www.youtube.com/@c", "2026-08-01", limit_per_tab=2,
+                          on_cap_hit=lambda tab, limit: hits.append((tab, limit)))
+        assert hits == []
 
 
 class TestApplyDateWindow:

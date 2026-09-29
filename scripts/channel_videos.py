@@ -3,6 +3,7 @@
 
 Usage:
     python channel_videos.py "<channel URL or @handle>" [--since-days N] [--limit N]
+        [--stop-after-old N] [--probe-pace SECONDS] [--max-listed N]
 
 Output (stdout): a JSON array of ``{video_id, title, channel, url, tab, published?}``.
 
@@ -47,7 +48,7 @@ ATOM_NS = {"a": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml
 DEFAULT_LISTING_CAP = 100
 
 # youtube.com, www.youtube.com and m.youtube.com are the same channel; a
-# manifest mixing them must dedupe to one poll (finding 11).
+# manifest mixing them must dedupe to one poll.
 _CANONICAL_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
 
 
@@ -91,7 +92,7 @@ def flat_list(url: str, limit: int | None = None) -> tuple[list[dict], str | Non
     title containing a literal tab survives intact.
     """
     args = ["--flat-playlist", "--no-warnings"]
-    if limit is not None:
+    if limit:
         args += ["--playlist-end", str(limit)]
     args += ["--print", "%(id)s\t%(playlist_channel)s\t%(title)s", url]
     result = yt.run_ytdlp(args)
@@ -111,7 +112,8 @@ def flat_list(url: str, limit: int | None = None) -> tuple[list[dict], str | Non
     return videos, None
 
 
-def list_channel(base_url: str, tabs=TABS, on_tab_error=None, limit_per_tab=None) -> list[dict]:
+def list_channel(base_url: str, tabs=TABS, on_tab_error=None, limit_per_tab=None,
+                 on_tab_listed=None) -> list[dict]:
     """Videos across the channel's tabs, deduped by id, listing order preserved.
 
     Raises if *every* tab failed — that means the channel reference is wrong (a
@@ -123,6 +125,12 @@ def list_channel(base_url: str, tabs=TABS, on_tab_error=None, limit_per_tab=None
     /videos, in which case the listing silently under-reports and the sweep's
     idempotence means a later rerun never notices the gap. The caller gets told
     either way and decides whether to care.
+
+    ``on_tab_listed`` gets each successful tab's raw video count and last
+    (oldest-listed) video id *before* the cross-tab dedupe below removes
+    anything — a caller deciding whether ``limit_per_tab`` actually cut a tab
+    off needs the count yt-dlp returned for that tab alone, not what survived
+    dedupe against every other tab.
     """
     seen, out, errors = set(), [], []
     for tab in tabs:
@@ -131,6 +139,8 @@ def list_channel(base_url: str, tabs=TABS, on_tab_error=None, limit_per_tab=None
             errors.append(f"{tab}: {error}")
             if on_tab_error:
                 on_tab_error(tab, error)
+        elif on_tab_listed:
+            on_tab_listed(tab, len(videos), videos[-1]["video_id"] if videos else None)
         for video in videos:
             if video["video_id"] in seen:
                 continue
@@ -176,7 +186,7 @@ def probe_upload_date(video_id: str) -> str:
     Raises when the failure is rate-limited or a network error: those are
     transient, and apply_date_window must not read a throttled probe as "this
     video is an undatable premiere" — that would let the walk run unpaced
-    through the whole channel history and silently return nothing (finding 4).
+    through the whole channel history and silently return nothing.
     """
     result = yt.run_ytdlp(["--skip-download", "--no-warnings",
                           "--print", "%(upload_date)s",
@@ -239,7 +249,7 @@ def apply_date_window(videos, cutoff, known_dates, stop_after_old=5, pace=0.0):
 
 def window_channel(base_url, cutoff, stop_after_old=5, probe_pace=1.0,
                    limit_per_tab=DEFAULT_LISTING_CAP, on_tab_error=None,
-                   on_rss_miss=None) -> list[dict]:
+                   on_rss_miss=None, on_cap_hit=None) -> list[dict]:
     """List a channel and keep only what falls inside the date window — the
     list -> RSS -> date-window sequence a sweep and ``main`` both need.
 
@@ -249,15 +259,43 @@ def window_channel(base_url, cutoff, stop_after_old=5, probe_pace=1.0,
     was never actually walked. A failed RSS lookup is not that: it only makes
     dating more expensive (every video gets probed individually), so it falls
     back to an empty dict instead, and ``on_rss_miss`` lets the caller say so.
+
+    ``on_cap_hit(tab, limit_per_tab)`` fires for a tab whose raw listing was
+    cut off at ``limit_per_tab`` *and* whose oldest listed video still made it
+    into the kept window — meaning videos beyond the cap could plausibly still
+    be in-window too, and were never even listed. A tab that came up short of
+    the cap on its own, or whose tail fell (or walked itself, via the early
+    stop above) out of the window, never fires it.
     """
-    videos = list_channel(base_url, limit_per_tab=limit_per_tab, on_tab_error=on_tab_error)
+    tab_listings = {}
+
+    def _note_tab(tab, raw_count, last_video_id):
+        tab_listings[tab] = (raw_count, last_video_id)
+
+    videos = list_channel(base_url, limit_per_tab=limit_per_tab, on_tab_error=on_tab_error,
+                          on_tab_listed=_note_tab)
     try:
         known = rss_dates(channel_id(base_url))
     except Exception as exc:
         known = {}
         if on_rss_miss:
             on_rss_miss(exc)
-    return apply_date_window(videos, cutoff, known, stop_after_old, probe_pace)
+    kept = apply_date_window(videos, cutoff, known, stop_after_old, probe_pace)
+
+    if on_cap_hit and limit_per_tab:
+        kept_ids = {video["video_id"] for video in kept}
+        for tab, (raw_count, last_video_id) in tab_listings.items():
+            if raw_count == limit_per_tab and last_video_id in kept_ids:
+                on_cap_hit(tab, limit_per_tab)
+
+    return kept
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be a non-negative integer: {value}")
+    return parsed
 
 
 def main():
@@ -270,9 +308,9 @@ def main():
                         help="Stop date-probing after this many consecutive out-of-window videos")
     parser.add_argument("--probe-pace", type=float, default=1.0,
                         help="Seconds between per-video date probes (default: 1)")
-    parser.add_argument("--max-listed", type=int, default=None,
-                        help=f"Cap videos listed per tab (default: {DEFAULT_LISTING_CAP} when "
-                             "--since-days is given, unlimited otherwise)")
+    parser.add_argument("--max-listed", type=_non_negative_int, default=None,
+                        help=f"Cap videos listed per tab, 0 = unlimited (default: {DEFAULT_LISTING_CAP} "
+                             "when --since-days is given, unlimited otherwise)")
     args = parser.parse_args()
 
     try:
@@ -285,11 +323,17 @@ def main():
     if limit_per_tab is None and args.since_days is not None:
         limit_per_tab = DEFAULT_LISTING_CAP
 
+    def _report_cap_hit(tab, limit):
+        print(json.dumps({
+            "warning": f"{tab} listing stopped at {limit} with its oldest video still in "
+                       "the window; raise --max-listed (0 = unlimited)",
+        }), file=sys.stderr)
+
     try:
         if args.since_days is not None:
             cutoff = (datetime.date.today() - datetime.timedelta(days=args.since_days)).isoformat()
             videos = window_channel(base, cutoff, args.stop_after_old, args.probe_pace,
-                                    limit_per_tab=limit_per_tab)
+                                    limit_per_tab=limit_per_tab, on_cap_hit=_report_cap_hit)
         else:
             videos = list_channel(base, limit_per_tab=limit_per_tab)
     except RuntimeError as exc:
