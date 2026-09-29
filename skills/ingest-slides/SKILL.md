@@ -34,7 +34,10 @@ python {plugin_dir}/scripts/slides.py fetch --dir <source folder>
 ```
 `{plugin_dir}` is the plugin's installation directory (the one containing
 `scripts/slides.py`). Video stream only, ≤1080p, into
-`<OS temp>/ingest-slides/<video_id>/`. Never commit it.
+`<OS temp>/ingest-slides/<video_id>/`. Never commit it. `fetch` shells out to
+`yt-dlp` directly, so it relies on the same certifi-based trust as the other
+`yt-dlp` calls this plugin makes — see `yt-summary:ingest`'s TLS interception
+notes if it fails with a certificate error behind a proxy.
 
 ### 2. Detect slide changes and build contact sheets
 ```bash
@@ -56,11 +59,17 @@ python {plugin_dir}/scripts/slides.py detect --dir <source folder> --crop <full|
 - **`DUP <i> of=<j>`** lines mark a sample whose perceptual hash matched an earlier kept
   one closely enough to call it a duplicate (an animation step, a dimmed repeat) — it's left
   out of the contact sheets by default. Pass `--keep-dups` to include duplicates in the
-  sheets anyway, or `--dup-threshold` to loosen (higher) or tighten (lower) the match.
-- **`BURST <i> ... n=<count> changes`** flags a group of three or more raw scene changes
-  that collapsed into one sample — likely an animation building up over several steps, not
-  one clean cut. Re-sample the burst's span at a higher `--fps` to see the steps
-  individually, as the printed line's own suggested command does.
+  sheets anyway, or `--dup-threshold` to loosen (higher) or tighten (lower) the match. It
+  compares each sample only against the earliest kept one in its run, so it can also mark a
+  later, more-complete step of a bullet-by-bullet build (or a new slide that happens to share
+  another's template) as a duplicate of the earlier, less-complete one — if a `SHEET` looks
+  like it is missing a slide you know is there, re-run with `--keep-dups` and check the frame
+  yourself rather than trusting the DUP line.
+- **`BURST <i> ... n=<count> changes`** flags a group of two or more raw scene changes that
+  collapsed into one sample — an animation building up over several steps, or a brief flash
+  (a one-off slide on screen just a second or two) whose own content the settled sample never
+  lands on. Re-sample the burst's span at a higher `--fps` to see the steps individually, as
+  the printed line's own suggested command does.
 - **`SPARSE <from>..<to>: one sample in <N>s`** flags a stretch longer than `--sparse`
   seconds (default 180) with no detected change — it may be hiding a slide the threshold
   missed. Either lower `--threshold` and re-run `detect`, or re-sample just that span with

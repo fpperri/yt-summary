@@ -91,7 +91,7 @@ off on its own.
   | Path | Honors |
   |---|---|
   | `youtube_transcript_api` | `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` |
-  | `yt-dlp` metadata + channel listings | neither — needs `--compat-options no-certifi` |
+  | `yt-dlp` metadata + channel listings | neither (certifi bundle; or `--compat-options no-certifi` for the OS store) |
   | `yt-dlp` caption download (curl_cffi, only once `--impersonate` kicks in) | same as metadata; under `--impersonate`: `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` |
   | channel RSS feed, oembed metadata fallback | `SSL_CERT_FILE`; on Windows, the system certificate store |
 

@@ -69,14 +69,18 @@ Follow the two format specs exactly:
   locate the nearest source passage it's drawn from. ("Four principles" is only
   the source's if the source said four; otherwise it's yours to label.)
 - **Quotes are verbatim and contiguous.** Never splice separate passages into one
-  quote; trim only with an ellipsis. A quote's timestamp is the line it actually
-  comes from, not the surrounding passage's.
+  quote. An ellipsis may only trim words out of the middle of one contiguous
+  passage — it never stands in for joining two separate ones. A quote's
+  timestamp is the line it actually comes from, not the surrounding passage's.
 - **Read slides alongside the transcript.** If `slides.<slug>.md` exists beside
   the source (written by `yt-summary:ingest-slides`), read it too. Cite slide
-  content as `(slide mm:ss)` next to the transcript locator, prefer the slide's
-  spelling over garbled captions for names, and note where narration and slides
-  disagree. Sponsor bands, event logos, and other frame chrome are not slide
-  content or attribution.
+  content as `(slide mm:ss)` next to the transcript locator, and note where
+  narration and slides disagree. Sponsor bands, event logos, and other frame
+  chrome are not slide content or attribution.
+- **A slide-corrected name is a note, not a silent edit.** When the slide spells
+  a name differently from the captions, use the slide's spelling but mark the
+  correction inline the first time it appears — `Alyx (slide 04:12; captions:
+  Alex)` — rather than picking one spelling and moving on.
 - **Faithful to this one source.** No cross-references to other material, no
   outside facts smuggled in. If the source is wrong, note that it is wrong — don't
   quietly correct it.

@@ -79,12 +79,15 @@ links, titles, or authors the source never mentions.
   principle list is yours rather than the source's own, say `*inference*` and
   point back to the passage it comes from.
 - **Quotes are verbatim and contiguous.** Never splice separate passages into
-  one quote; trim only with an ellipsis, and match the timestamp to the line the
-  quote actually comes from.
+  one quote. An ellipsis may only trim words out of the middle of one
+  contiguous passage — it never stands in for joining two separate ones — and
+  the timestamp matches the line the quote actually comes from.
 - **If `slides.<slug>.md` exists beside the source, read it.** Cite slide
-  content as `(slide mm:ss)` beside a transcript locator, prefer its spelling of
-  names over garbled captions, and note where narration and slides disagree.
-  Frame chrome (sponsor bands, event logos) isn't slide content.
+  content as `(slide mm:ss)` beside a transcript locator, and note where
+  narration and slides disagree. Frame chrome (sponsor bands, event logos)
+  isn't slide content. Where the slide's spelling of a name corrects garbled
+  captions, use it but mark the correction inline the first time it appears —
+  `Alyx (slide mm:ss; captions: Alex)`.
 - **Plain language first.** If a concept can only be stated in the source's
   jargon, the guide has not done its job.
 - **Scale to the source.** A ten-minute video gets three concepts and eight

@@ -75,13 +75,15 @@ Five to ten lowercase keywords, comma-separated. Subject matter, not format.
   say so and locate the passage it's drawn from, in Key points as much as
   anywhere.
 - **Quotes are verbatim and contiguous.** Never splice separate passages into
-  one quote; trim only with an ellipsis, and give the timestamp of the line the
-  quote actually comes from.
+  one quote. An ellipsis may only trim words out of the middle of one
+  contiguous passage — it never stands in for joining two separate ones — and
+  the timestamp given is the line the quote actually comes from.
 - **If `slides.<slug>.md` exists beside the source, read it.** Cite slide
-  content as `(slide mm:ss)` beside the transcript locator, prefer its spelling
-  of names over garbled captions, and note narration/slide disagreements in
-  Evidence vs assertion. Frame chrome (sponsor bands, event logos) isn't slide
-  content.
+  content as `(slide mm:ss)` beside the transcript locator, and note
+  narration/slide disagreements in Evidence vs assertion. Frame chrome
+  (sponsor bands, event logos) isn't slide content. Where the slide's spelling
+  of a name corrects garbled captions, use it but mark the correction inline
+  the first time it appears — `Alyx (slide mm:ss; captions: Alex)`.
 - **In a vacuum.** No references to other sources, no outside knowledge. Tags are
   the only mechanism connecting this to anything else.
 - **Don't pad.** A thin source gets a short analysis. Empty sections are removed,
