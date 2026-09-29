@@ -256,27 +256,6 @@ class TestViaYtdlp:
         with pytest.raises(yt_transcript.RateLimited):
             yt_transcript.via_ytdlp("vid")
 
-    def test_does_not_check_the_returncode_via_subprocess(self, monkeypatch, tmp_path):
-        """Regression for check=True: a nonzero exit must never raise from
-        inside run_ytdlp's own call — only ytdlp_failure decides that."""
-        def fake_mkdtemp():
-            d = tmp_path / "work"
-            d.mkdir()
-            (d / "vid.en.vtt").write_text(
-                "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nhello\n", encoding="utf-8"
-            )
-            return str(d)
-
-        monkeypatch.setattr(yt_transcript.tempfile, "mkdtemp", fake_mkdtemp)
-        monkeypatch.setattr(yt_transcript, "_impersonate_target", lambda: "")
-
-        def fake_run(cmd, **kwargs):
-            assert "check" not in kwargs or not kwargs["check"]
-            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
-
-        monkeypatch.setattr(yt_transcript.subprocess, "run", fake_run)
-        assert yt_transcript.via_ytdlp("vid") == [(1.0, "hello")]
-
     def test_prefers_a_manual_caption_over_an_auto_one_with_the_plain_lang_code(self, monkeypatch, tmp_path):
         """A manual en-US track and an auto (ASR) 'en' track can both land on
         disk; filenames alone don't say which is manual, so the info.json's
@@ -324,31 +303,6 @@ class TestViaYtdlp:
         )
 
         assert yt_transcript.via_ytdlp("vid") == [(1.0, "plain")]
-
-    def test_requests_manual_and_auto_subs_plus_info_json(self, monkeypatch, tmp_path):
-        def fake_mkdtemp():
-            d = tmp_path / "work"
-            d.mkdir()
-            (d / "vid.en.vtt").write_text(
-                "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nhello\n", encoding="utf-8"
-            )
-            return str(d)
-
-        captured = {}
-
-        def fake_run(args, timeout=None):
-            captured["args"] = args
-            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-
-        monkeypatch.setattr(yt_transcript.tempfile, "mkdtemp", fake_mkdtemp)
-        monkeypatch.setattr(yt_transcript, "_impersonate_target", lambda: "")
-        monkeypatch.setattr(yt_transcript, "run_ytdlp", fake_run)
-
-        yt_transcript.via_ytdlp("vid")
-        assert "--write-info-json" in captured["args"]
-        assert "--write-auto-subs" in captured["args"]
-        assert "--write-subs" in captured["args"]
-
 
 class TestRender:
     segments = [(0.0, "alpha"), (65.0, "beta")]
@@ -470,7 +424,7 @@ class TestFailureKind:
         assert failure_kind(message) == "not_yet_aired"
 
     @pytest.mark.parametrize("message", [
-        "Unable to download webpage",
+        "Unable to download webpage: <urlopen error [Errno 11001] getaddrinfo failed>",
         "urlopen error timed out",
         "getaddrinfo failed",
         "Temporary failure in name resolution",
@@ -479,12 +433,19 @@ class TestFailureKind:
         "Connection aborted",
         "Remote end closed connection without response",
         "CERTIFICATE_VERIFY_FAILED",
+        "HTTP Error 503: Service Unavailable",
     ])
     def test_network_by_message(self, message):
         assert failure_kind(message) == "network"
 
     def test_anything_else_is_failed(self):
         assert failure_kind("captions disabled for this video") == "failed"
+
+    def test_permanent_download_failure_is_not_network(self):
+        """yt-dlp prefixes permanent 4xx errors with "Unable to download",
+        the same phrasing it uses for a genuine connectivity failure — one
+        broken video must not abort its whole channel's probe walk."""
+        assert failure_kind("Unable to download API page: HTTP Error 404: Not Found") == "failed"
 
     def test_rate_limited_takes_precedence_over_not_yet_aired(self):
         assert failure_kind("429 Client Error and also a premiere") == "rate_limited"

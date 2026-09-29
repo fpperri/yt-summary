@@ -67,9 +67,9 @@ _NOT_YET_AIRED_RE = re.compile(
     r"premiere|live event will begin|not yet available|hasn't started", re.I
 )
 _NETWORK_RE = re.compile(
-    r"Unable to download|urlopen error|timed out|getaddrinfo|"
+    r"urlopen error|timed out|getaddrinfo|"
     r"Temporary failure in name resolution|Connection (reset|refused|aborted)|"
-    r"Remote end closed|CERTIFICATE_VERIFY_FAILED",
+    r"Remote end closed|CERTIFICATE_VERIFY_FAILED|HTTP Error 5\d\d",
     re.I,
 )
 
