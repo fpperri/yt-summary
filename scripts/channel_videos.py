@@ -4,7 +4,7 @@
 Usage:
     python channel_videos.py "<channel URL or @handle>" [--since-days N] [--limit N]
 
-Output (stdout): a JSON array of ``{video_id, title, url, tab, published?}``.
+Output (stdout): a JSON array of ``{video_id, title, channel, url, tab, published?}``.
 
 Two details worth knowing before changing this:
 
@@ -23,13 +23,18 @@ filters the returned titles semantically. This script stays deterministic.
 import argparse
 import datetime
 import json
+import os
 import re
 import ssl
-import subprocess
 import sys
 import time
 import urllib.request
 from itertools import groupby
+from urllib.parse import urlsplit, urlunsplit
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import yt_transcript as yt  # noqa: E402
 
 try:
     from defusedxml.ElementTree import fromstring as xml_fromstring
@@ -39,6 +44,11 @@ except Exception:
 TABS = ("videos", "shorts")
 RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={}"
 ATOM_NS = {"a": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
+DEFAULT_LISTING_CAP = 100
+
+# youtube.com, www.youtube.com and m.youtube.com are the same channel; a
+# manifest mixing them must dedupe to one poll (finding 11).
+_CANONICAL_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
 
 
 def normalize_channel_url(value: str) -> str:
@@ -53,6 +63,10 @@ def normalize_channel_url(value: str) -> str:
     elif not value.startswith(("http://", "https://")):
         value = "https://" + value
 
+    parts = urlsplit(value)
+    if parts.netloc.lower() in _CANONICAL_HOSTS:
+        value = urlunsplit(parts._replace(scheme="https", netloc="www.youtube.com"))
+
     # Strip a trailing tab only when something identifying the channel precedes
     # it. Without that guard a channel literally handled "@videos" loses its own
     # handle and we end up requesting https://www.youtube.com/videos.
@@ -66,28 +80,38 @@ def normalize_channel_url(value: str) -> str:
     return value
 
 
-def flat_list(url: str) -> tuple[list[dict], str | None]:
+def flat_list(url: str, limit: int | None = None) -> tuple[list[dict], str | None]:
     """(videos, error). A failing tab is not on its own a problem — a channel
-    with no shorts has no /shorts page — so the caller decides what it means."""
-    cmd = ["yt-dlp", "--flat-playlist", "--no-warnings",
-           "--print", "%(id)s\t%(title)s", url]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    with no shorts has no /shorts page — so the caller decides what it means.
+
+    ``channel`` comes from ``%(playlist_channel)s`` — the per-entry
+    ``%(channel)s`` is ``NA`` in a flat listing, but the top-level one is set
+    for every entry on the tab; yt-dlp's own "NA" placeholder becomes "".
+    The print template puts title last and this splits with ``maxsplit`` so a
+    title containing a literal tab survives intact.
+    """
+    args = ["--flat-playlist", "--no-warnings"]
+    if limit is not None:
+        args += ["--playlist-end", str(limit)]
+    args += ["--print", "%(id)s\t%(playlist_channel)s\t%(title)s", url]
+    result = yt.run_ytdlp(args)
     if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        return [], stderr.splitlines()[-1] if stderr else f"yt-dlp exited {result.returncode}"
+        return [], str(yt.ytdlp_failure(result))
 
     videos = []
     for line in result.stdout.strip().splitlines():
-        if "\t" not in line:
+        parts = line.split("\t", 2)
+        if len(parts) < 3:
             continue
-        video_id, title = line.split("\t", 1)
-        video_id, title = video_id.strip(), title.strip()
+        video_id, channel, title = (part.strip() for part in parts)
+        if channel == "NA":
+            channel = ""
         if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
-            videos.append({"video_id": video_id, "title": title})
+            videos.append({"video_id": video_id, "title": title, "channel": channel})
     return videos, None
 
 
-def list_channel(base_url: str, tabs=TABS, on_tab_error=None) -> list[dict]:
+def list_channel(base_url: str, tabs=TABS, on_tab_error=None, limit_per_tab=None) -> list[dict]:
     """Videos across the channel's tabs, deduped by id, listing order preserved.
 
     Raises if *every* tab failed — that means the channel reference is wrong (a
@@ -102,7 +126,7 @@ def list_channel(base_url: str, tabs=TABS, on_tab_error=None) -> list[dict]:
     """
     seen, out, errors = set(), [], []
     for tab in tabs:
-        videos, error = flat_list(f"{base_url}/{tab}")
+        videos, error = flat_list(f"{base_url}/{tab}", limit_per_tab)
         if error:
             errors.append(f"{tab}: {error}")
             if on_tab_error:
@@ -121,10 +145,11 @@ def list_channel(base_url: str, tabs=TABS, on_tab_error=None) -> list[dict]:
 def channel_id(url: str) -> str:
     """The UC… id, needed to build the RSS URL. Read from a one-item flat dump —
     in flat mode the per-entry channel_id is NA, but the top-level one is set."""
-    cmd = ["yt-dlp", "--flat-playlist", "--playlist-items", "1", "-J",
-           "--no-warnings", url]
-    data = json.loads(subprocess.run(cmd, capture_output=True, text=True, check=True).stdout)
-    cid = data.get("channel_id")
+    result = yt.run_ytdlp(["--flat-playlist", "--playlist-items", "1", "-J",
+                          "--no-warnings", url])
+    if result.returncode != 0:
+        raise yt.ytdlp_failure(result)
+    cid = json.loads(result.stdout).get("channel_id")
     if not cid:
         raise RuntimeError("could not resolve channel_id")
     return cid
@@ -146,13 +171,23 @@ def rss_dates(cid: str) -> dict[str, str]:
 
 def probe_upload_date(video_id: str) -> str:
     """'YYYY-MM-DD' for one video, or '' if it cannot be resolved (an unaired
-    premiere, a members-only video, a deleted id)."""
-    cmd = ["yt-dlp", "--skip-download", "--no-warnings",
-           "--print", "%(upload_date)s",
-           f"https://www.youtube.com/watch?v={video_id}"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    premiere, a members-only video, a deleted id).
+
+    Raises when the failure is rate-limited or a network error: those are
+    transient, and apply_date_window must not read a throttled probe as "this
+    video is an undatable premiere" — that would let the walk run unpaced
+    through the whole channel history and silently return nothing (finding 4).
+    """
+    result = yt.run_ytdlp(["--skip-download", "--no-warnings",
+                          "--print", "%(upload_date)s",
+                          f"https://www.youtube.com/watch?v={video_id}"])
+    if result.returncode != 0:
+        exc = yt.ytdlp_failure(result)
+        if yt.failure_kind(exc) in ("rate_limited", "network"):
+            raise exc
+        return ""
     raw = result.stdout.strip()
-    if result.returncode != 0 or len(raw) != 8 or not raw.isdigit():
+    if len(raw) != 8 or not raw.isdigit():
         return ""
     return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
 
@@ -202,6 +237,29 @@ def apply_date_window(videos, cutoff, known_dates, stop_after_old=5, pace=0.0):
     return kept
 
 
+def window_channel(base_url, cutoff, stop_after_old=5, probe_pace=1.0,
+                   limit_per_tab=DEFAULT_LISTING_CAP, on_tab_error=None,
+                   on_rss_miss=None) -> list[dict]:
+    """List a channel and keep only what falls inside the date window — the
+    list -> RSS -> date-window sequence a sweep and ``main`` both need.
+
+    A listing or a probe failure (an exhausted rate limit, a network error)
+    propagates rather than being folded into "nothing in the window", since a
+    caller retrying blind on an empty result would never notice the channel
+    was never actually walked. A failed RSS lookup is not that: it only makes
+    dating more expensive (every video gets probed individually), so it falls
+    back to an empty dict instead, and ``on_rss_miss`` lets the caller say so.
+    """
+    videos = list_channel(base_url, limit_per_tab=limit_per_tab, on_tab_error=on_tab_error)
+    try:
+        known = rss_dates(channel_id(base_url))
+    except Exception as exc:
+        known = {}
+        if on_rss_miss:
+            on_rss_miss(exc)
+    return apply_date_window(videos, cutoff, known, stop_after_old, probe_pace)
+
+
 def main():
     parser = argparse.ArgumentParser(description="List a channel's videos as JSON")
     parser.add_argument("channel", help="Channel URL or @handle")
@@ -212,6 +270,9 @@ def main():
                         help="Stop date-probing after this many consecutive out-of-window videos")
     parser.add_argument("--probe-pace", type=float, default=1.0,
                         help="Seconds between per-video date probes (default: 1)")
+    parser.add_argument("--max-listed", type=int, default=None,
+                        help=f"Cap videos listed per tab (default: {DEFAULT_LISTING_CAP} when "
+                             "--since-days is given, unlimited otherwise)")
     args = parser.parse_args()
 
     try:
@@ -220,8 +281,17 @@ def main():
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         sys.exit(1)
 
+    limit_per_tab = args.max_listed
+    if limit_per_tab is None and args.since_days is not None:
+        limit_per_tab = DEFAULT_LISTING_CAP
+
     try:
-        videos = list_channel(base)
+        if args.since_days is not None:
+            cutoff = (datetime.date.today() - datetime.timedelta(days=args.since_days)).isoformat()
+            videos = window_channel(base, cutoff, args.stop_after_old, args.probe_pace,
+                                    limit_per_tab=limit_per_tab)
+        else:
+            videos = list_channel(base, limit_per_tab=limit_per_tab)
     except RuntimeError as exc:
         print(json.dumps({"error": f"could not list {base}", "detail": str(exc)}), file=sys.stderr)
         sys.exit(1)
@@ -229,14 +299,6 @@ def main():
     if not videos:
         print(json.dumps({"error": f"no videos listed for {base}"}), file=sys.stderr)
         sys.exit(1)
-
-    if args.since_days is not None:
-        cutoff = (datetime.date.today() - datetime.timedelta(days=args.since_days)).isoformat()
-        try:
-            known = rss_dates(channel_id(base))
-        except Exception:
-            known = {}  # every video gets probed individually instead
-        videos = apply_date_window(videos, cutoff, known, args.stop_after_old, args.probe_pace)
 
     if args.limit is not None:
         videos = videos[: args.limit]
