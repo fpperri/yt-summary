@@ -53,9 +53,13 @@ def fetch_metadata(video_id: str) -> tuple[str, str, str]:
     oembed carries no upload date, so it only ever fills whichever of title/
     channel yt-dlp came back without -- never overwrites a field yt-dlp did
     resolve.
+
+    --skip-download still makes yt-dlp pick a format, which fails outright when
+    YouTube withholds formats for this client; --ignore-no-formats-error keeps
+    that from blanking title and channel too.
     """
     cmd = [
-        "--skip-download", "--no-warnings",
+        "--skip-download", "--ignore-no-formats-error", "--no-warnings",
         "--print", "%(title)s\t%(channel)s\t%(upload_date)s",
         f"https://www.youtube.com/watch?v={video_id}",
     ]
@@ -135,6 +139,41 @@ def _yaml_scalar(value: str) -> str:
     return f'"{value}"'
 
 
+_FRONTMATTER_FIELD = re.compile(r"^(title|channel|published):\s*(.*)$", re.M)
+
+
+def _unquote_yaml_scalar(raw: str) -> str:
+    """Reverse ``_yaml_scalar``: strip its wrapping quotes and undo the
+    backslash/quote escaping it applied, so a value round-trips through a
+    written transcript file instead of coming back with literal backslashes."""
+    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+        raw = raw[1:-1]
+    return raw.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _existing_metadata(path) -> dict[str, str]:
+    """title/channel/published already recorded in a transcript file's
+    frontmatter, so a --force refetch that comes back empty-handed for a
+    field has something to fall back to rather than blanking it."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return {}
+    return {name: _unquote_yaml_scalar(raw.strip())
+            for name, raw in _FRONTMATTER_FIELD.findall(head)}
+
+
+def _find_existing_transcript(folder: Path, video_id: str) -> Path | None:
+    """The transcript file already living in ``folder`` whose frontmatter
+    records this id -- however the folder itself came to be renamed, since a
+    rename is explicitly supported and must not spawn a second transcript."""
+    for path in folder.glob("transcript.*.md"):
+        if transcript_video_id(path) == video_id:
+            return path
+    return None
+
+
 def build_document(video_id, title, channel, published, retrieved, method, segments) -> str:
     frontmatter = [
         "---",
@@ -178,6 +217,15 @@ def ingest(source: str, output_dir=DEFAULT_OUTPUT_DIR, force: bool = False,
         if not published and len(upload_date) == 8:
             published = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
 
+    existing_file = None
+    if existing_folder is not None:
+        existing_file = _find_existing_transcript(existing_folder, video_id)
+        if existing_file is not None:
+            prior = _existing_metadata(existing_file)
+            title = title or prior.get("title", "")
+            channel = channel or prior.get("channel", "")
+            published = published or prior.get("published", "")
+
     fallback_slug = not (title or channel)
     slug = slugify(channel, title, fallback=video_id)
 
@@ -185,9 +233,10 @@ def ingest(source: str, output_dir=DEFAULT_OUTPUT_DIR, force: bool = False,
         # force is set and this id is already ingested: land back in its own
         # folder rather than letting a changed title reslug it into a second one.
         target, already = existing_folder, True
+        slug = existing_file.stem[len("transcript."):] if existing_file is not None else target.name
     else:
         target, already = resolve_target(output_dir, slug, video_id)
-    slug = target.name
+        slug = target.name
 
     if already and not force:
         return {"slug": slug, "video_id": video_id, "path": str(target), "skipped": True}
@@ -199,7 +248,8 @@ def ingest(source: str, output_dir=DEFAULT_OUTPUT_DIR, force: bool = False,
         video_id, title, channel, published,
         datetime.date.today().isoformat(), method, segments,
     )
-    (target / f"transcript.{slug}.md").write_text(document, encoding="utf-8")
+    destination = existing_file if existing_file is not None else target / f"transcript.{slug}.md"
+    destination.write_text(document, encoding="utf-8")
 
     return {
         "slug": slug, "video_id": video_id, "path": str(target),
@@ -210,12 +260,7 @@ def ingest(source: str, output_dir=DEFAULT_OUTPUT_DIR, force: bool = False,
 
 
 def main():
-    # A piped stdout defaults to cp1252 on Windows; a title or channel name
-    # containing non-cp1252 characters would otherwise crash print() with a
-    # UnicodeEncodeError instead of just printing it.
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8")
+    yt.utf8_stdio()
 
     parser = argparse.ArgumentParser(description="Ingest a YouTube video's transcript")
     parser.add_argument("source", help="YouTube URL or video ID")

@@ -155,6 +155,20 @@ class TestFetchMetadata:
         self._oembed_raises(monkeypatch)
         assert fetch_metadata(VID) == ("", "", "")
 
+    def test_tolerates_formats_yt_dlp_cannot_select(self, monkeypatch):
+        """--skip-download still runs format selection; a withheld-formats
+        video must not blank the title and channel it already resolved."""
+        captured = {}
+
+        def fake_run(args, timeout=None):
+            captured["args"] = args
+            return SimpleNamespace(returncode=0, stdout="A Talk\tSome Channel\t20260102\n", stderr="")
+
+        monkeypatch.setattr(ingest_video.yt, "run_ytdlp", fake_run)
+        self._oembed_raises(monkeypatch)
+        fetch_metadata(VID)
+        assert "--ignore-no-formats-error" in captured["args"]
+
 
 class TestIngest:
     def _stub(self, monkeypatch, segments=None):
@@ -233,6 +247,26 @@ class TestIngest:
         written = tmp_path / result["slug"] / f"transcript.{result['slug']}.md"
         assert "renamed" in written.read_text(encoding="utf-8")
 
+    def test_force_rewrites_the_transcript_in_a_folder_the_user_renamed(self, tmp_path, monkeypatch):
+        """A user-renamed folder still holds transcript.<old-slug>.md; force
+        must overwrite that file rather than adding a second transcript."""
+        self._stub(monkeypatch)
+        first = ingest(VID, tmp_path)
+        old_folder = tmp_path / first["slug"]
+        renamed_folder = tmp_path / "renamed-by-user"
+        old_folder.rename(renamed_folder)
+
+        monkeypatch.setattr(ingest_video, "fetch_metadata",
+                            lambda vid: ("A Different Talk", "Some Channel", "20260102"))
+        monkeypatch.setattr(ingest_video.yt, "fetch_segments",
+                            lambda vid: ([(0.0, "renamed folder refetch")], "api"))
+        result = ingest(VID, tmp_path, force=True, ingested={VID: renamed_folder})
+
+        assert result["slug"] == first["slug"]
+        files = list(renamed_folder.glob("*.md"))
+        assert len(files) == 1
+        assert "renamed folder refetch" in files[0].read_text(encoding="utf-8")
+
     def test_hints_are_used_and_metadata_is_not_fetched_when_complete(self, tmp_path, monkeypatch):
         def must_not_run(vid):
             raise AssertionError("hints covering title and channel make a metadata fetch pointless")
@@ -272,6 +306,24 @@ class TestIngest:
 
         written = tmp_path / result["slug"] / f"transcript.{result['slug']}.md"
         assert "published: 2020-01-01" in written.read_text(encoding="utf-8")
+
+    def test_force_keeps_prior_metadata_when_a_refetch_comes_back_empty(self, tmp_path, monkeypatch):
+        """A metadata outage during --force must not blank a title and
+        channel the previous ingest already resolved."""
+        self._stub(monkeypatch)
+        ingest(VID, tmp_path)
+
+        monkeypatch.setattr(ingest_video, "fetch_metadata", lambda vid: ("", "", ""))
+        monkeypatch.setattr(ingest_video.yt, "fetch_segments", lambda vid: ([(9.0, "refetched")], "api"))
+        result = ingest(VID, tmp_path, force=True)
+
+        assert result["fallback_slug"] is False
+        written = tmp_path / result["slug"] / f"transcript.{result['slug']}.md"
+        text = written.read_text(encoding="utf-8")
+        assert 'title: "A Talk"' in text
+        assert 'channel: "Some Channel"' in text
+        assert "published: 2026-01-02" in text
+        assert "refetched" in text
 
     def test_missing_metadata_still_yields_a_unique_slug(self, tmp_path, monkeypatch):
         monkeypatch.setattr(ingest_video, "fetch_metadata", lambda vid: ("", "", ""))
