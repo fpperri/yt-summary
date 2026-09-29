@@ -14,7 +14,6 @@ import argparse
 import datetime
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -51,25 +50,31 @@ def fetch_metadata(video_id: str) -> tuple[str, str, str]:
     Channel and title decide the slug, so losing them does not cost a field --
     it files the video under its own id where nobody will find it again. That is
     worth a second attempt by a different route when the first route fails.
+    oembed carries no upload date, so it only ever fills whichever of title/
+    channel yt-dlp came back without -- never overwrites a field yt-dlp did
+    resolve.
     """
     cmd = [
-        "yt-dlp", "--skip-download", "--no-warnings",
+        "--skip-download", "--no-warnings",
         "--print", "%(title)s\t%(channel)s\t%(upload_date)s",
         f"https://www.youtube.com/watch?v={video_id}",
     ]
     title = channel = upload_date = ""
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
-        fields = (out.strip().split("\t") + ["", "", ""])[:3]
-        title, channel, upload_date = ("" if f == "NA" else f.strip() for f in fields)
+        result = yt.run_ytdlp(cmd)
+        if result.returncode == 0:
+            fields = (result.stdout.strip().split("\t") + ["", "", ""])[:3]
+            title, channel, upload_date = ("" if f == "NA" else f.strip() for f in fields)
     except Exception:
         pass
 
     if not (title and channel):
         try:
-            title, channel = fetch_metadata_oembed(video_id)
+            o_title, o_channel = fetch_metadata_oembed(video_id)
         except Exception:
-            pass
+            o_title, o_channel = "", ""
+        title = title or o_title
+        channel = channel or o_channel
 
     return title, channel, upload_date
 
@@ -85,18 +90,25 @@ def transcript_video_id(path) -> str | None:
     return match.group(1) if match else None
 
 
-def ingested_video_ids(output_dir) -> set[str]:
-    """Every video id already ingested under ``output_dir``.
+def ingested_videos(output_dir) -> dict[str, Path]:
+    """Every video id already ingested under ``output_dir``, mapped to its folder.
 
     This is what makes a sweep idempotent — it is keyed on the id in the
     frontmatter, not on folder names, so a renamed folder never causes a refetch.
+    ``ingest`` looks a video up here before fetching any metadata; a sweep passes
+    its own precomputed map so each call doesn't rescan the output directory.
     """
-    found = set()
+    found = {}
     for path in Path(output_dir).glob("*/transcript.*.md"):
         vid = transcript_video_id(path)
         if vid:
-            found.add(vid)
+            found[vid] = path.parent
     return found
+
+
+def ingested_video_ids(output_dir) -> set[str]:
+    """Every video id already ingested under ``output_dir``."""
+    return set(ingested_videos(output_dir))
 
 
 def resolve_target(output_dir, slug: str, video_id: str) -> tuple[Path, bool]:
@@ -133,7 +145,7 @@ def build_document(video_id, title, channel, published, retrieved, method, segme
         "---",
         f"source: https://www.youtube.com/watch?v={video_id}",
         "type: transcript",
-        f"video_id: {video_id}",
+        f'video_id: "{video_id}"',
         f"title: {_yaml_scalar(title)}",
         f"channel: {_yaml_scalar(channel)}",
         f"published: {published}",
@@ -147,20 +159,39 @@ def build_document(video_id, title, channel, published, retrieved, method, segme
     return "\n".join(frontmatter) + f"# {heading}\n\n" + body + "\n"
 
 
-def ingest(source: str, output_dir=DEFAULT_OUTPUT_DIR, force: bool = False) -> dict:
+def ingest(source: str, output_dir=DEFAULT_OUTPUT_DIR, force: bool = False,
+           hints: dict | None = None, ingested: dict[str, Path] | None = None) -> dict:
     video_id = yt.extract_video_id(source)
+    hints = hints or {}
 
-    try:
-        title, channel, upload_date = fetch_metadata(video_id)
-    except Exception:
-        title, channel, upload_date = "", "", ""
+    if ingested is None:
+        ingested = ingested_videos(output_dir)
 
-    published = (
-        f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
-        if len(upload_date) == 8 else ""
-    )
+    existing_folder = ingested.get(video_id)
+    if existing_folder is not None and not force:
+        return {"slug": existing_folder.name, "video_id": video_id,
+                "path": str(existing_folder), "skipped": True}
+
+    title = hints.get("title") or ""
+    channel = hints.get("channel") or ""
+    published = hints.get("published") or ""
+
+    if not (title and channel):
+        m_title, m_channel, upload_date = fetch_metadata(video_id)
+        title = title or m_title
+        channel = channel or m_channel
+        if not published and len(upload_date) == 8:
+            published = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
+
+    fallback_slug = not (title or channel)
     slug = slugify(channel, title, fallback=video_id)
-    target, already = resolve_target(output_dir, slug, video_id)
+
+    if existing_folder is not None:
+        # force is set and this id is already ingested: land back in its own
+        # folder rather than letting a changed title reslug it into a second one.
+        target, already = existing_folder, True
+    else:
+        target, already = resolve_target(output_dir, slug, video_id)
     slug = target.name
 
     if already and not force:
@@ -179,10 +210,18 @@ def ingest(source: str, output_dir=DEFAULT_OUTPUT_DIR, force: bool = False) -> d
         "slug": slug, "video_id": video_id, "path": str(target),
         "skipped": False, "method": method,
         "segments": len(segments), "title": title,
+        "fallback_slug": fallback_slug,
     }
 
 
 def main():
+    # A piped stdout defaults to cp1252 on Windows; a title or channel name
+    # containing non-cp1252 characters would otherwise crash print() with a
+    # UnicodeEncodeError instead of just printing it.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+
     parser = argparse.ArgumentParser(description="Ingest a YouTube video's transcript")
     parser.add_argument("source", help="YouTube URL or video ID")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR,
@@ -205,6 +244,11 @@ def main():
             f"OK {result['video_id']} [{result['method']}] "
             f"{result['segments']} segments :: {result['title'] or '(no title)'}"
         )
+        if result["fallback_slug"]:
+            print(
+                f"WARN {result['video_id']}: no title or channel resolved; "
+                f"filed under {result['slug']}", file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":

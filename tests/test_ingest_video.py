@@ -1,8 +1,12 @@
+from types import SimpleNamespace
+
 import ingest_video
 from ingest_video import (
     build_document,
+    fetch_metadata,
     ingest,
     ingested_video_ids,
+    ingested_videos,
     resolve_target,
     transcript_video_id,
 )
@@ -37,6 +41,15 @@ class TestIngestedVideoIds:
 
     def test_empty_directory(self, tmp_path):
         assert ingested_video_ids(tmp_path) == set()
+
+
+class TestIngestedVideos:
+    def test_maps_id_to_its_folder(self, tmp_path):
+        folder = write_source_set(tmp_path, "a-one", VID)
+        assert ingested_videos(tmp_path) == {VID: folder}
+
+    def test_empty_directory(self, tmp_path):
+        assert ingested_videos(tmp_path) == {}
 
 
 class TestResolveTarget:
@@ -79,7 +92,7 @@ class TestBuildDocument:
             VID, "Title", "Chan", "2026-01-02", "2026-09-01", "api",
             [(0.0, "first"), (65.0, "second")],
         )
-        assert f"video_id: {VID}" in doc
+        assert f'video_id: "{VID}"' in doc
         assert "fetched_via: api" in doc
         assert "published: 2026-01-02" in doc
         assert "[00:00] first" in doc
@@ -93,6 +106,52 @@ class TestBuildDocument:
         doc = build_document(VID, "T", "C", "", "2026-09-01", "api", [(0.0, "x")])
         assert ".cortex" not in doc
         assert "inquiry/sources" not in doc
+
+    def test_quotes_the_video_id_so_it_cannot_parse_as_a_yaml_number(self):
+        doc = build_document(VID, "T", "C", "", "2026-09-01", "api", [(0.0, "x")])
+        assert f'video_id: "{VID}"' in doc
+
+    def test_quoted_video_id_round_trips_through_transcript_video_id(self, tmp_path):
+        doc = build_document(VID, "T", "C", "", "2026-09-01", "api", [(0.0, "x")])
+        path = tmp_path / "doc.md"
+        path.write_text(doc, encoding="utf-8")
+        assert transcript_video_id(path) == VID
+
+
+class TestFetchMetadata:
+    def _ytdlp(self, monkeypatch, stdout="", returncode=0):
+        monkeypatch.setattr(
+            ingest_video.yt, "run_ytdlp",
+            lambda args, timeout=None: SimpleNamespace(returncode=returncode, stdout=stdout, stderr=""),
+        )
+
+    def _oembed(self, monkeypatch, title="", channel=""):
+        monkeypatch.setattr(ingest_video, "fetch_metadata_oembed", lambda vid: (title, channel))
+
+    def _oembed_raises(self, monkeypatch):
+        def raiser(vid):
+            raise RuntimeError("oembed unavailable")
+        monkeypatch.setattr(ingest_video, "fetch_metadata_oembed", raiser)
+
+    def test_reads_title_channel_and_date_from_ytdlp(self, monkeypatch):
+        self._ytdlp(monkeypatch, stdout="A Talk\tSome Channel\t20260102\n")
+        self._oembed_raises(monkeypatch)
+        assert fetch_metadata(VID) == ("A Talk", "Some Channel", "20260102")
+
+    def test_falls_back_to_oembed_when_ytdlp_fails_entirely(self, monkeypatch):
+        self._ytdlp(monkeypatch, returncode=1)
+        self._oembed(monkeypatch, title="Oembed Title", channel="Oembed Channel")
+        assert fetch_metadata(VID) == ("Oembed Title", "Oembed Channel", "")
+
+    def test_oembed_fills_only_the_field_ytdlp_left_empty(self, monkeypatch):
+        self._ytdlp(monkeypatch, stdout="A Talk\tNA\t20260102\n")
+        self._oembed(monkeypatch, title="Oembed Title", channel="Oembed Channel")
+        assert fetch_metadata(VID) == ("A Talk", "Oembed Channel", "20260102")
+
+    def test_both_sources_failing_yields_empty_strings_without_raising(self, monkeypatch):
+        self._ytdlp(monkeypatch, returncode=1)
+        self._oembed_raises(monkeypatch)
+        assert fetch_metadata(VID) == ("", "", "")
 
 
 class TestIngest:
@@ -108,6 +167,7 @@ class TestIngest:
 
         assert result["slug"] == "some-channel-a-talk"
         assert result["skipped"] is False
+        assert result["fallback_slug"] is False
         written = tmp_path / "some-channel-a-talk" / "transcript.some-channel-a-talk.md"
         assert written.exists()
         assert "[00:00] hello" in written.read_text(encoding="utf-8")
@@ -122,6 +182,28 @@ class TestIngest:
         monkeypatch.setattr(ingest_video.yt, "fetch_segments", must_not_run)
         assert ingest(VID, tmp_path)["skipped"] is True
 
+    def test_second_run_skips_before_fetching_metadata(self, tmp_path, monkeypatch):
+        self._stub(monkeypatch)
+        ingest(VID, tmp_path)
+
+        def must_not_run(vid):
+            raise AssertionError("an already-ingested video must not have its metadata refetched")
+
+        monkeypatch.setattr(ingest_video, "fetch_metadata", must_not_run)
+        assert ingest(VID, tmp_path)["skipped"] is True
+
+    def test_precomputed_ingested_map_is_used_instead_of_scanning(self, tmp_path, monkeypatch):
+        self._stub(monkeypatch)
+        first = ingest(VID, tmp_path)
+
+        def must_not_run(vid):
+            raise AssertionError("a precomputed ingested map must short-circuit the fetch")
+
+        monkeypatch.setattr(ingest_video, "fetch_metadata", must_not_run)
+        monkeypatch.setattr(ingest_video.yt, "fetch_segments", must_not_run)
+        precomputed = {VID: tmp_path / first["slug"]}
+        assert ingest(VID, tmp_path, ingested=precomputed)["skipped"] is True
+
     def test_force_refetches(self, tmp_path, monkeypatch):
         self._stub(monkeypatch)
         ingest(VID, tmp_path)
@@ -132,13 +214,68 @@ class TestIngest:
         written = tmp_path / result["slug"] / f"transcript.{result['slug']}.md"
         assert "refetched" in written.read_text(encoding="utf-8")
 
-    def test_missing_metadata_still_yields_a_unique_slug(self, tmp_path, monkeypatch):
-        def no_metadata(vid):
-            raise RuntimeError("yt-dlp unavailable")
+    def test_force_rewrites_the_existing_folder_when_the_slug_would_change(self, tmp_path, monkeypatch):
+        """A changed title reslugs the video; force must still land in the folder
+        the frontmatter id already lives in rather than starting a second copy."""
+        self._stub(monkeypatch)
+        first = ingest(VID, tmp_path)
 
-        monkeypatch.setattr(ingest_video, "fetch_metadata", no_metadata)
+        monkeypatch.setattr(ingest_video, "fetch_metadata",
+                            lambda vid: ("A Different Talk", "Some Channel", "20260102"))
+        monkeypatch.setattr(ingest_video.yt, "fetch_segments",
+                            lambda vid: ([(0.0, "renamed")], "api"))
+        result = ingest(VID, tmp_path, force=True)
+
+        assert result["path"] == first["path"]
+        assert len(list(tmp_path.iterdir())) == 1
+        written = tmp_path / result["slug"] / f"transcript.{result['slug']}.md"
+        assert "renamed" in written.read_text(encoding="utf-8")
+
+    def test_hints_are_used_and_metadata_is_not_fetched_when_complete(self, tmp_path, monkeypatch):
+        def must_not_run(vid):
+            raise AssertionError("hints covering title and channel make a metadata fetch pointless")
+
+        monkeypatch.setattr(ingest_video, "fetch_metadata", must_not_run)
+        monkeypatch.setattr(ingest_video.yt, "fetch_segments", lambda vid: ([(0.0, "hi")], "api"))
+
+        hints = {"title": "Hinted Talk", "channel": "Hinted Channel", "published": "2026-03-04"}
+        result = ingest(VID, tmp_path, hints=hints)
+
+        assert result["fallback_slug"] is False
+        written = tmp_path / result["slug"] / f"transcript.{result['slug']}.md"
+        text = written.read_text(encoding="utf-8")
+        assert 'title: "Hinted Talk"' in text
+        assert 'channel: "Hinted Channel"' in text
+        assert "published: 2026-03-04" in text
+
+    def test_partial_hints_fill_only_the_missing_fields_from_metadata(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ingest_video, "fetch_metadata",
+                            lambda vid: ("Metadata Title", "Metadata Channel", "20260102"))
+        monkeypatch.setattr(ingest_video.yt, "fetch_segments", lambda vid: ([(0.0, "hi")], "api"))
+
+        result = ingest(VID, tmp_path, hints={"title": "Hinted Talk"})
+
+        written = tmp_path / result["slug"] / f"transcript.{result['slug']}.md"
+        text = written.read_text(encoding="utf-8")
+        assert 'title: "Hinted Talk"' in text
+        assert 'channel: "Metadata Channel"' in text
+        assert "published: 2026-01-02" in text
+
+    def test_hinted_published_is_not_overwritten_by_metadata(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ingest_video, "fetch_metadata",
+                            lambda vid: ("Metadata Title", "Metadata Channel", "20260102"))
+        monkeypatch.setattr(ingest_video.yt, "fetch_segments", lambda vid: ([(0.0, "hi")], "api"))
+
+        result = ingest(VID, tmp_path, hints={"published": "2020-01-01"})
+
+        written = tmp_path / result["slug"] / f"transcript.{result['slug']}.md"
+        assert "published: 2020-01-01" in written.read_text(encoding="utf-8")
+
+    def test_missing_metadata_still_yields_a_unique_slug(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ingest_video, "fetch_metadata", lambda vid: ("", "", ""))
         monkeypatch.setattr(ingest_video.yt, "fetch_segments", lambda vid: ([(0.0, "x")], "api"))
 
         first = ingest(VID, tmp_path)
         second = ingest(OTHER, tmp_path)
         assert first["slug"] != second["slug"]
+        assert first["fallback_slug"] is True
