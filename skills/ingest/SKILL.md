@@ -71,7 +71,7 @@ off on its own.
   language. Nothing to do; report it and move on.
 - **An unaired premiere** — it has no captions until it airs. Try again later.
 - **TLS interception** (corporate proxy, some AV suites) — `CERTIFICATE_VERIFY_FAILED`
-  or `curl: (60)`. Fetching crosses three paths that do **not** share a trust
+  or `curl: (60)`. Fetching crosses several paths that do **not** share a trust
   store, so fixing one can leave the others failing:
 
   | Path | Honors |
@@ -79,10 +79,14 @@ off on its own.
   | `youtube_transcript_api` | `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` |
   | `yt-dlp` metadata + channel listings | neither — needs `--compat-options no-certifi` |
   | `yt-dlp` caption download (curl_cffi) | `CURL_CA_BUNDLE` |
+  | channel RSS feed, oembed metadata fallback | `SSL_CERT_FILE`; on Windows, the system certificate store |
 
-  All three default to the **certifi** bundle, so appending the proxy's root CA
-  to it (`python -m certifi` prints the path) fixes everything in one step. The
-  env-var route works too; put `--compat-options no-certifi` in the yt-dlp user
+  The first three default to the **certifi** bundle, so appending the proxy's
+  root CA to it (`python -m certifi` prints the path) covers them in one step.
+  The fourth (plain `urllib`, used for RSS dates and the oembed fallback) checks
+  the OS's own certificate store instead, so it needs the CA installed there, or
+  `SSL_CERT_FILE` pointed at a bundle that includes it. The env-var route works
+  for the first three too; put `--compat-options no-certifi` in the yt-dlp user
   config (`%APPDATA%\yt-dlp\config`, or `~/.config/yt-dlp/config`) so it applies
   to every call this plugin makes.
 

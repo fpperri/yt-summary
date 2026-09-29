@@ -12,12 +12,14 @@
 # One channel per line. Blank lines are ignored. Everything after a `#` is a
 # comment, so you can annotate a line inline.
 #
-# Any of these forms work, and all four of the lines below would resolve to the
-# same channel and be polled only once:
+# Any of these forms work, and all five of the lines below would resolve to the
+# same channel and be polled only once — youtube.com, www.youtube.com and
+# m.youtube.com are treated as the same host:
 #
 #   @examplechannel
 #   youtube.com/@examplechannel
 #   https://www.youtube.com/@examplechannel
+#   https://m.youtube.com/@examplechannel
 #   https://www.youtube.com/@examplechannel/videos
 #
 # A /channel/UC... URL works too:

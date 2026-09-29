@@ -33,10 +33,14 @@ Install the plugin's Python dependencies:
 - **Behind a TLS-inspecting proxy** (corporate MITM, some AV suites): install with
   `pip install --cert <path-to-ca.pem> -r requirements.txt`.
 
-  For fetching, the simplest complete fix is to append the proxy's root CA to the
-  certifi bundle (`python -m certifi` prints the path) — all three of the plugin's
-  network paths default to it. Per-path env vars (`SSL_CERT_FILE` /
-  `REQUESTS_CA_BUNDLE` for the API, `CURL_CA_BUNDLE` for yt-dlp's caption
-  download) work too; see the `ingest` skill for the full table.
+  For fetching, appending the proxy's root CA to the certifi bundle
+  (`python -m certifi` prints the path) covers three of the plugin's network
+  paths — `youtube_transcript_api`, yt-dlp metadata/listings, and yt-dlp's
+  caption download. A fourth path (the channel RSS feed and the oembed metadata
+  fallback, both plain `urllib`) checks the OS's own certificate store instead,
+  so the CA needs to land there too, or in `SSL_CERT_FILE`. Per-path env vars
+  (`SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` for the API, `CURL_CA_BUNDLE` for
+  yt-dlp's caption download) work too; see the `ingest` skill for the full
+  table.
 
   Never disable certificate verification to work around this.

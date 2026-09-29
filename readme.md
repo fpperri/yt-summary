@@ -61,6 +61,13 @@ python scripts/sweep.py my-channels.txt --output-dir output --since-days 7 --dry
 python scripts/sweep.py my-channels.txt --output-dir output --since-days 7
 ```
 
+`sweep.py` exits `0` on a clean run, `1` if a video or a whole channel failed and
+nothing was ingested, `2` if it gave up rate-limited — see the comment above
+`exit_code` in `scripts/sweep.py` for the exact rule. Both `sweep.py` and
+`channel_videos.py` take `--max-listed` to cap how many videos are listed per
+channel tab (default 100 once a date window is in play; see `scripts/sweep.py
+--help` / `scripts/channel_videos.py --help`).
+
 An ingested video lands as:
 
 ```
@@ -90,7 +97,7 @@ locations are safe by default.
   If you're already blocked, wait it out — retrying keeps the block hot.
   `YT_NO_API=1` skips the API endpoint, which is usually the first to block.
 - **Behind a TLS-inspecting proxy?** (corporate MITM, some AV suites — the symptom
-  is `CERTIFICATE_VERIFY_FAILED` or `curl: (60)`.) Fetching crosses three code
+  is `CERTIFICATE_VERIFY_FAILED` or `curl: (60)`.) Fetching crosses several code
   paths and they do **not** share a trust store, so a fix that resolves one can
   leave the others failing:
 
@@ -99,13 +106,16 @@ locations are safe by default.
   | `youtube-transcript-api` | requests → certifi | `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` |
   | `yt-dlp` metadata + channel listings | urllib → certifi | neither |
   | `yt-dlp` caption download | curl_cffi → libcurl | `CURL_CA_BUNDLE` |
+  | channel RSS feed, oembed metadata fallback | urllib → OS/stdlib trust store | `SSL_CERT_FILE`; on Windows, the system certificate store |
 
-  **The one fix that covers all three** is to append your proxy's root CA to the
-  certifi bundle every one of them defaults to — `python -m certifi` prints its
-  path. Alternatively, set all three environment variables, and add
-  `--compat-options no-certifi` to your yt-dlp user config
+  Appending your proxy's root CA to the **certifi** bundle — `python -m certifi`
+  prints its path — covers the first three. The fourth (plain `urllib`, used for
+  RSS dates and the oembed fallback) verifies against your OS's own certificate
+  store instead, so it needs the CA installed there, or `SSL_CERT_FILE` pointed
+  at a bundle that includes it. Alternatively, set all three env vars above, and
+  add `--compat-options no-certifi` to your yt-dlp user config
   (`%APPDATA%\yt-dlp\config` on Windows, `~/.config/yt-dlp/config` elsewhere) so
-  its metadata calls fall back to the OS trust store.
+  its metadata calls fall back to the OS trust store too.
 
   The plugin does no certificate handling of its own and never disables
   verification — don't reach for `--no-check-certificates`, which turns the

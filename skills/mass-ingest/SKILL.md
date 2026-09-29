@@ -96,7 +96,7 @@ To inspect or filter one channel without sweeping a manifest:
 python {plugin_dir}/scripts/channel_videos.py "<channel URL or @handle>" --since-days 30 [--limit N]
 ```
 
-Returns JSON `{video_id, title, url, tab, published?}`. If the user wants videos
+Returns JSON `{video_id, title, channel, url, tab, published?}`. If the user wants videos
 *about* a topic, filter the returned **titles** yourself — deliberately not done
 in the script, so relevance judgment stays with you and no transcript is fetched
 just to decide it isn't relevant.

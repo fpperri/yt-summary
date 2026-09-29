@@ -20,9 +20,14 @@ not share a trust store, so a fix for one can leave the others failing:
 * ``yt-dlp``'s caption download runs through curl_cffi and honors
   ``CURL_CA_BUNDLE``.
 
-All three default to the certifi bundle, so appending the proxy's root CA to it
-fixes every path at once. This script does no certificate handling of its own and
-never disables verification.
+Those three default to the certifi bundle, so appending the proxy's root CA to it
+covers them in one step. A fourth path — the plain ``urllib`` calls used
+elsewhere in this plugin for the channel RSS feed and the oembed metadata
+fallback — is not certifi-based: it uses the OS/stdlib trust store, which
+honors ``SSL_CERT_FILE`` and, on Windows, loads the system certificate store.
+The proxy's root CA needs to land there too (or in ``SSL_CERT_FILE``) for those
+calls to verify. This script does no certificate handling of its own and never
+disables verification.
 
 Usage:
     python yt_transcript.py <URL or VIDEO_ID> [--timestamps] [--delay SECONDS]
