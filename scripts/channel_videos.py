@@ -291,8 +291,13 @@ def window_channel(base_url, cutoff, stop_after_old=5, probe_pace=1.0,
     return kept
 
 
-def _non_negative_int(value: str) -> int:
-    parsed = int(value)
+def non_negative_int(value: str) -> int:
+    """argparse type for --max-listed, shared with sweep.py so both CLIs accept
+    the same values."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        parsed = -1
     if parsed < 0:
         raise argparse.ArgumentTypeError(f"must be a non-negative integer: {value}")
     return parsed
@@ -308,7 +313,7 @@ def main():
                         help="Stop date-probing after this many consecutive out-of-window videos")
     parser.add_argument("--probe-pace", type=float, default=1.0,
                         help="Seconds between per-video date probes (default: 1)")
-    parser.add_argument("--max-listed", type=_non_negative_int, default=None,
+    parser.add_argument("--max-listed", type=non_negative_int, default=None,
                         help=f"Cap videos listed per tab, 0 = unlimited (default: {DEFAULT_LISTING_CAP} "
                              "when --since-days is given, unlimited otherwise)")
     args = parser.parse_args()

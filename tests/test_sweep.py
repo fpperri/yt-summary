@@ -253,6 +253,33 @@ class TestSweep:
         assert "CHANNEL-FAIL" in out
         assert "rate limited" in out.lower()
 
+    def test_a_429_in_a_plain_listing_error_still_counts_as_blocked(self, tmp_path, monkeypatch):
+        """A listing that fails on every tab surfaces as a plain RuntimeError
+        joining each tab's yt-dlp message, not as a typed RateLimited."""
+        def failing_listing(url, cutoff, *args, **kwargs):
+            raise RuntimeError("videos: ERROR: Unable to download webpage: HTTP Error 429: "
+                               "Too Many Requests; shorts: ERROR: HTTP Error 429: Too Many Requests")
+
+        monkeypatch.setattr(sweep_module.cv, "window_channel", failing_listing)
+        result = sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0)
+
+        assert result["channels_blocked"] == 1
+        assert sweep_module.exit_code(result) == 2
+
+    def test_the_closing_line_names_failed_and_blocked_channels(self, tmp_path, monkeypatch, capsys):
+        """A run that exits 2 only because every channel walk was blocked must
+        not end on a line that reads like an idle, clean sweep."""
+        def blocked(url, cutoff, *args, **kwargs):
+            raise sweep_module.yt.RateLimited("HTTP Error 429: Too Many Requests")
+
+        monkeypatch.setattr(sweep_module.cv, "window_channel", blocked)
+        sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0)
+
+        closing = capsys.readouterr().out.strip().splitlines()[-1]
+        assert "sweep end:" in closing
+        assert "channels_failed=1" in closing
+        assert "channels_blocked=1" in closing
+
     def test_cap_hit_on_a_channel_tab_is_logged(self, tmp_path, monkeypatch, capsys):
         """window_channel calls back on_cap_hit when a tab's listing was cut
         off with in-window videos possibly still beyond the cap — surfacing

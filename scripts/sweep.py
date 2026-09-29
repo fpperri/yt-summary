@@ -201,11 +201,13 @@ def sweep(manifest, output_dir=DEFAULT_OUTPUT_DIR, since_days=7, limit_per_chann
         else:
             ingested += 1
             ingested_map[video_id] = Path(result["path"])
-            note = " (fallback slug: no title/channel resolved)" if result.get("fallback_slug") else ""
+            note = (" (fallback slug: no title/channel resolved; delete the folder and rerun "
+                    "once metadata resolves)") if result.get("fallback_slug") else ""
             log(f"OK [{ingested}] {video_id} -> {result['slug']}{note}", logpath)
             time.sleep(pace)
 
-    log(f"sweep end: ingested={ingested} skipped={skipped} failed={failed}"
+    log(f"sweep end: ingested={ingested} skipped={skipped} failed={failed} "
+        f"channels_failed={channels_failed} channels_blocked={channels_blocked}"
         f"{' (gave up: rate limited)' if blocked else ''}", logpath)
     return {"ingested": ingested, "skipped": skipped, "failed": failed,
             "blocked": blocked, "candidates": todo, "channels_failed": channels_failed,
@@ -223,13 +225,6 @@ def exit_code(result) -> int:
     if (result["failed"] or result["channels_failed"]) and not result["ingested"]:
         return 1
     return 0
-
-
-def _non_negative_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError(f"must be non-negative: {value}")
-    return parsed
 
 
 def main():
@@ -256,7 +251,7 @@ def main():
                         help="Stop date-probing a channel after this many consecutive old videos")
     parser.add_argument("--probe-pace", type=float, default=1.0,
                         help="Seconds between per-video date probes while polling (default: 1)")
-    parser.add_argument("--max-listed", type=_non_negative_int, default=cv.DEFAULT_LISTING_CAP,
+    parser.add_argument("--max-listed", type=cv.non_negative_int, default=cv.DEFAULT_LISTING_CAP,
                         help="Cap videos listed per channel tab, 0 = unlimited "
                              f"(default: {cv.DEFAULT_LISTING_CAP})")
     parser.add_argument("--dry-run", action="store_true",

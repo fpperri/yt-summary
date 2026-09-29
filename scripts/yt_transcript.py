@@ -66,10 +66,16 @@ _RATE_LIMITED_RE = re.compile(
 _NOT_YET_AIRED_RE = re.compile(
     r"premiere|live event will begin|not yet available|hasn't started", re.I
 )
+# yt-dlp words a dropped connection and a permanent 404 the same way ("Unable to
+# download webpage: ..."), so the prefix counts as transport only when the reason
+# after it is not an HTTP 4xx — one broken video must not abort a channel's probe
+# walk, but a dropped connection must not quietly empty it either.
 _NETWORK_RE = re.compile(
-    r"urlopen error|timed out|getaddrinfo|"
+    r"Unable to download(?!.*HTTP Error 4\d\d)|urlopen error|timed out|getaddrinfo|"
     r"Temporary failure in name resolution|Connection (reset|refused|aborted)|"
-    r"Remote end closed|CERTIFICATE_VERIFY_FAILED|HTTP Error 5\d\d",
+    r"Remote end closed|CERTIFICATE_VERIFY_FAILED|HTTP Error 5\d\d|"
+    r"WinError 100\d\d|Network is unreachable|No connection could be made|"
+    r"EOF occurred in violation of protocol|IncompleteRead",
     re.I,
 )
 

@@ -434,6 +434,13 @@ class TestFailureKind:
         "Remote end closed connection without response",
         "CERTIFICATE_VERIFY_FAILED",
         "HTTP Error 503: Service Unavailable",
+        "Unable to download webpage: <urlopen error [WinError 10060] A connection attempt "
+        "failed because the connected party did not properly respond after a period of time>",
+        "Unable to download webpage: [WinError 10061] No connection could be made because "
+        "the target machine actively refused it",
+        "Unable to download API page: [Errno 101] Network is unreachable",
+        "Unable to download webpage: EOF occurred in violation of protocol (_ssl.c:2427)",
+        "Unable to download webpage: IncompleteRead(1024 bytes read, 2048 more expected)",
     ])
     def test_network_by_message(self, message):
         assert failure_kind(message) == "network"
@@ -441,11 +448,15 @@ class TestFailureKind:
     def test_anything_else_is_failed(self):
         assert failure_kind("captions disabled for this video") == "failed"
 
-    def test_permanent_download_failure_is_not_network(self):
+    @pytest.mark.parametrize("message", [
+        "Unable to download API page: HTTP Error 404: Not Found",
+        "Unable to download webpage: HTTP Error 403: Forbidden",
+    ])
+    def test_permanent_download_failure_is_not_network(self, message):
         """yt-dlp prefixes permanent 4xx errors with "Unable to download",
         the same phrasing it uses for a genuine connectivity failure — one
         broken video must not abort its whole channel's probe walk."""
-        assert failure_kind("Unable to download API page: HTTP Error 404: Not Found") == "failed"
+        assert failure_kind(message) == "failed"
 
     def test_rate_limited_takes_precedence_over_not_yet_aired(self):
         assert failure_kind("429 Client Error and also a premiere") == "rate_limited"

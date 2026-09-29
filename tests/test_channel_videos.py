@@ -273,8 +273,18 @@ class TestProbeUploadDate:
             cv.yt, "run_ytdlp",
             lambda args, timeout=None: ytdlp_result(returncode=1, stderr="urlopen error timed out\n"),
         )
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError) as raised:
             cv.probe_upload_date("aaaaaaaaaaa")
+        assert cv.yt.failure_kind(raised.value) == "network"
+
+    def test_a_permanent_http_error_is_undatable_not_raised(self, monkeypatch):
+        monkeypatch.setattr(
+            cv.yt, "run_ytdlp",
+            lambda args, timeout=None: ytdlp_result(
+                returncode=1, stderr="ERROR: [youtube] aaaaaaaaaaa: Unable to download API page: "
+                                     "HTTP Error 404: Not Found\n"),
+        )
+        assert cv.probe_upload_date("aaaaaaaaaaa") == ""
 
     def test_other_failures_return_empty_string(self, monkeypatch):
         """A private/deleted video or a genuine premiere is not transient — the
@@ -336,6 +346,20 @@ class TestWindowChannel:
         assert [v["video_id"] for v in kept] == ["aaaaaaaaaaa"]
         assert len(misses) == 1
         assert "could not resolve channel" in str(misses[0])
+
+    def test_a_failed_rss_fetch_falls_back_to_probing(self, monkeypatch):
+        fake = FakeYtDlp(tabs={"videos": [("aaaaaaaaaaa", "t1")]}, dates={"aaaaaaaaaaa": "20260830"})
+        monkeypatch.setattr(cv.yt, "run_ytdlp", fake)
+
+        def unreachable_feed(url, context=None, timeout=None):
+            raise OSError("CERTIFICATE_VERIFY_FAILED")
+
+        monkeypatch.setattr(cv.urllib.request, "urlopen", unreachable_feed)
+
+        misses = []
+        kept = cv.window_channel("https://www.youtube.com/@c", "2026-08-01", on_rss_miss=misses.append)
+        assert [(v["video_id"], v["published"]) for v in kept] == [("aaaaaaaaaaa", "2026-08-30")]
+        assert "CERTIFICATE_VERIFY_FAILED" in str(misses[0])
 
     def test_listing_failure_on_every_tab_propagates(self, monkeypatch):
         fake = FakeYtDlp(listing_errors={
