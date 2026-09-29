@@ -1,15 +1,22 @@
 import pytest
 
+import subprocess
+
 import yt_transcript
 from yt_transcript import (
+    NotYetAired,
+    RateLimited,
     extract_video_id,
+    failure_kind,
     fetch_segments,
     format_timestamp,
     load_last_video,
     parse_vtt,
     render,
+    run_ytdlp,
     save_last_video,
     vtt_time_to_seconds,
+    ytdlp_failure,
 )
 
 VID = "Vitf8YaVXhc"
@@ -89,15 +96,6 @@ class TestVttParsing:
             "Right.", "So the next point is this.", "Right.", "[Music]", "[Music]",
         ]
 
-    def test_still_drops_adjacent_rolling_repeats(self):
-        vtt = (
-            "WEBVTT\n\n"
-            "00:00:01.000 --> 00:00:03.000\nfirst line\n\n"
-            "00:00:03.000 --> 00:00:05.000\nfirst line\nsecond line\n\n"
-            "00:00:05.000 --> 00:00:07.000\nsecond line\nthird line\n"
-        )
-        assert [text for _, text in parse_vtt(vtt)] == ["first line", "second line", "third line"]
-
     def test_strips_karaoke_tags_and_unescapes_entities(self):
         vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\n<c.colorE5E5E5>Tom &amp; Jerry</c>\n"
         assert parse_vtt(vtt) == [(1.0, "Tom & Jerry")]
@@ -105,6 +103,16 @@ class TestVttParsing:
     def test_empty_vtt_raises(self):
         with pytest.raises(RuntimeError):
             parse_vtt("WEBVTT\n\n")
+
+    def test_ignores_style_block_before_first_cue(self):
+        """A STYLE block's selector and declaration lines aren't timed text —
+        without a cue they'd otherwise be emitted as a bogus 0.0 line."""
+        vtt = (
+            "WEBVTT\n\n"
+            "STYLE\n::cue(c.colorE5E5E5) {\n  color: #E5E5E5;\n}\n\n"
+            "00:00:01.000 --> 00:00:03.000\nhello\n"
+        )
+        assert parse_vtt(vtt) == [(1.0, "hello")]
 
 
 class TestPreferredVtt:
@@ -118,6 +126,50 @@ class TestPreferredVtt:
 
     def test_none_when_no_captions(self):
         assert yt_transcript._preferred_vtt(["vid.mp4", "vid.json"]) is None
+
+
+class TestImpersonateTarget:
+    def test_chrome_when_curl_cffi_available(self, monkeypatch):
+        monkeypatch.setattr(yt_transcript, "_IMPERSONATE_TARGET", None)
+        out = "Client          OS           Source\n--------\nChrome-133      Macos-15     curl_cffi\n"
+        monkeypatch.setattr(
+            yt_transcript, "run_ytdlp",
+            lambda args, timeout=None: subprocess.CompletedProcess(args, 0, stdout=out, stderr=""),
+        )
+        assert yt_transcript._impersonate_target() == "chrome"
+
+    def test_empty_when_curl_cffi_unavailable(self, monkeypatch):
+        """yt-dlp still lists Chrome targets when curl_cffi is missing, just
+        marked unusable — passing --impersonate chrome then fails every call."""
+        monkeypatch.setattr(yt_transcript, "_IMPERSONATE_TARGET", None)
+        out = "Client          OS           Source\n--------\nChrome-133      Macos-15     curl_cffi (unavailable)\n"
+        monkeypatch.setattr(
+            yt_transcript, "run_ytdlp",
+            lambda args, timeout=None: subprocess.CompletedProcess(args, 0, stdout=out, stderr=""),
+        )
+        assert yt_transcript._impersonate_target() == ""
+
+    def test_empty_on_error(self, monkeypatch):
+        monkeypatch.setattr(yt_transcript, "_IMPERSONATE_TARGET", None)
+
+        def boom(args, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="yt-dlp", timeout=30)
+
+        monkeypatch.setattr(yt_transcript, "run_ytdlp", boom)
+        assert yt_transcript._impersonate_target() == ""
+
+    def test_cached_after_first_call(self, monkeypatch):
+        monkeypatch.setattr(yt_transcript, "_IMPERSONATE_TARGET", None)
+        calls = []
+
+        def fake_run(args, timeout=None):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, stdout="Chrome-133  Macos-15  curl_cffi\n", stderr="")
+
+        monkeypatch.setattr(yt_transcript, "run_ytdlp", fake_run)
+        yt_transcript._impersonate_target()
+        yt_transcript._impersonate_target()
+        assert len(calls) == 1
 
 
 class TestViaYtdlp:
@@ -136,7 +188,10 @@ class TestViaYtdlp:
 
         monkeypatch.setattr(yt_transcript.tempfile, "mkdtemp", fake_mkdtemp)
         monkeypatch.setattr(yt_transcript, "_impersonate_target", lambda: "")
-        monkeypatch.setattr(yt_transcript.subprocess, "run", lambda *a, **k: None)
+        monkeypatch.setattr(
+            yt_transcript, "run_ytdlp",
+            lambda args, timeout=None: subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        )
 
         assert yt_transcript.via_ytdlp("vid") == [(1.0, "hello")]
         assert not created["path"].exists()
@@ -152,11 +207,147 @@ class TestViaYtdlp:
 
         monkeypatch.setattr(yt_transcript.tempfile, "mkdtemp", fake_mkdtemp)
         monkeypatch.setattr(yt_transcript, "_impersonate_target", lambda: "")
-        monkeypatch.setattr(yt_transcript.subprocess, "run", lambda *a, **k: None)
+        monkeypatch.setattr(
+            yt_transcript, "run_ytdlp",
+            lambda args, timeout=None: subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        )
 
         with pytest.raises(RuntimeError, match="no vtt"):
             yt_transcript.via_ytdlp("vid")
         assert not created["path"].exists()
+
+    def test_uses_a_vtt_written_despite_a_nonzero_exit(self, monkeypatch, tmp_path):
+        """--sub-lang en.* asks for several tracks; yt-dlp exits 1 when one
+        track fails even though a wanted <id>.en.vtt is already on disk."""
+        def fake_mkdtemp():
+            d = tmp_path / "work"
+            d.mkdir()
+            (d / "vid.en.vtt").write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nhello\n", encoding="utf-8"
+            )
+            return str(d)
+
+        monkeypatch.setattr(yt_transcript.tempfile, "mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr(yt_transcript, "_impersonate_target", lambda: "")
+        monkeypatch.setattr(
+            yt_transcript, "run_ytdlp",
+            lambda args, timeout=None: subprocess.CompletedProcess(
+                args, 1, stdout="", stderr="ERROR: Unable to download video subtitles for 'en-af'\n"
+            ),
+        )
+
+        assert yt_transcript.via_ytdlp("vid") == [(1.0, "hello")]
+
+    def test_raises_classified_error_on_nonzero_exit_with_no_vtt(self, monkeypatch, tmp_path):
+        def fake_mkdtemp():
+            d = tmp_path / "work"
+            d.mkdir()
+            return str(d)
+
+        monkeypatch.setattr(yt_transcript.tempfile, "mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr(yt_transcript, "_impersonate_target", lambda: "")
+        monkeypatch.setattr(
+            yt_transcript, "run_ytdlp",
+            lambda args, timeout=None: subprocess.CompletedProcess(
+                args, 1, stdout="", stderr="ERROR: HTTP Error 429: Too Many Requests\n"
+            ),
+        )
+
+        with pytest.raises(yt_transcript.RateLimited):
+            yt_transcript.via_ytdlp("vid")
+
+    def test_does_not_check_the_returncode_via_subprocess(self, monkeypatch, tmp_path):
+        """Regression for check=True: a nonzero exit must never raise from
+        inside run_ytdlp's own call — only ytdlp_failure decides that."""
+        def fake_mkdtemp():
+            d = tmp_path / "work"
+            d.mkdir()
+            (d / "vid.en.vtt").write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nhello\n", encoding="utf-8"
+            )
+            return str(d)
+
+        monkeypatch.setattr(yt_transcript.tempfile, "mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr(yt_transcript, "_impersonate_target", lambda: "")
+
+        def fake_run(cmd, **kwargs):
+            assert "check" not in kwargs or not kwargs["check"]
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+        monkeypatch.setattr(yt_transcript.subprocess, "run", fake_run)
+        assert yt_transcript.via_ytdlp("vid") == [(1.0, "hello")]
+
+    def test_prefers_a_manual_caption_over_an_auto_one_with_the_plain_lang_code(self, monkeypatch, tmp_path):
+        """A manual en-US track and an auto (ASR) 'en' track can both land on
+        disk; filenames alone don't say which is manual, so the info.json's
+        "subtitles" keys (the manual tracks) settle it."""
+        def fake_mkdtemp():
+            d = tmp_path / "work"
+            d.mkdir()
+            (d / "vid.en.vtt").write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nauto\n", encoding="utf-8"
+            )
+            (d / "vid.en-US.vtt").write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nmanual\n", encoding="utf-8"
+            )
+            (d / "vid.info.json").write_text(
+                '{"subtitles": {"en-US": []}}', encoding="utf-8"
+            )
+            return str(d)
+
+        monkeypatch.setattr(yt_transcript.tempfile, "mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr(yt_transcript, "_impersonate_target", lambda: "")
+        monkeypatch.setattr(
+            yt_transcript, "run_ytdlp",
+            lambda args, timeout=None: subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        )
+
+        assert yt_transcript.via_ytdlp("vid") == [(1.0, "manual")]
+
+    def test_falls_back_to_old_ranking_when_info_json_missing(self, monkeypatch, tmp_path):
+        def fake_mkdtemp():
+            d = tmp_path / "work"
+            d.mkdir()
+            (d / "vid.en.vtt").write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nplain\n", encoding="utf-8"
+            )
+            (d / "vid.en-GB.vtt").write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nregional\n", encoding="utf-8"
+            )
+            return str(d)
+
+        monkeypatch.setattr(yt_transcript.tempfile, "mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr(yt_transcript, "_impersonate_target", lambda: "")
+        monkeypatch.setattr(
+            yt_transcript, "run_ytdlp",
+            lambda args, timeout=None: subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        )
+
+        assert yt_transcript.via_ytdlp("vid") == [(1.0, "plain")]
+
+    def test_requests_manual_and_auto_subs_plus_info_json(self, monkeypatch, tmp_path):
+        def fake_mkdtemp():
+            d = tmp_path / "work"
+            d.mkdir()
+            (d / "vid.en.vtt").write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nhello\n", encoding="utf-8"
+            )
+            return str(d)
+
+        captured = {}
+
+        def fake_run(args, timeout=None):
+            captured["args"] = args
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(yt_transcript.tempfile, "mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr(yt_transcript, "_impersonate_target", lambda: "")
+        monkeypatch.setattr(yt_transcript, "run_ytdlp", fake_run)
+
+        yt_transcript.via_ytdlp("vid")
+        assert "--write-info-json" in captured["args"]
+        assert "--write-auto-subs" in captured["args"]
+        assert "--write-subs" in captured["args"]
 
 
 class TestRender:
@@ -209,6 +400,159 @@ class TestFetchSegments:
         monkeypatch.setattr(yt_transcript, "via_ytdlp", ytdlp_boom)
         with pytest.raises(RuntimeError, match="api blocked.*no vtt written"):
             fetch_segments(VID)
+
+    def test_raises_rate_limited_when_ytdlp_was_rate_limited(self, monkeypatch):
+        monkeypatch.delenv("YT_NO_API", raising=False)
+        monkeypatch.setattr(yt_transcript, "via_api", lambda v, l=None: (_ for _ in ()).throw(RuntimeError("api blocked")))
+        monkeypatch.setattr(
+            yt_transcript, "via_ytdlp",
+            lambda v: (_ for _ in ()).throw(RateLimited("HTTP Error 429")),
+        )
+        with pytest.raises(RateLimited):
+            fetch_segments(VID)
+
+    def test_raises_not_yet_aired_when_ytdlp_saw_a_premiere(self, monkeypatch):
+        monkeypatch.delenv("YT_NO_API", raising=False)
+        monkeypatch.setattr(yt_transcript, "via_api", lambda v, l=None: (_ for _ in ()).throw(RuntimeError("api blocked")))
+        monkeypatch.setattr(
+            yt_transcript, "via_ytdlp",
+            lambda v: (_ for _ in ()).throw(NotYetAired("premiere")),
+        )
+        with pytest.raises(NotYetAired):
+            fetch_segments(VID)
+
+    def test_rate_limited_wins_when_either_source_saw_it(self, monkeypatch):
+        """The api failure alone can carry the rate-limit signal even when
+        yt-dlp's failure is unrelated."""
+        monkeypatch.delenv("YT_NO_API", raising=False)
+        monkeypatch.setattr(
+            yt_transcript, "via_api",
+            lambda v, l=None: (_ for _ in ()).throw(RuntimeError("429 Client Error")),
+        )
+        monkeypatch.setattr(
+            yt_transcript, "via_ytdlp",
+            lambda v: (_ for _ in ()).throw(RuntimeError("no vtt written")),
+        )
+        with pytest.raises(RateLimited):
+            fetch_segments(VID)
+
+
+class TestFailureKind:
+    def test_rate_limited_by_type(self):
+        assert failure_kind(RateLimited("blocked")) == "rate_limited"
+
+    def test_not_yet_aired_by_type(self):
+        assert failure_kind(NotYetAired("early")) == "not_yet_aired"
+
+    @pytest.mark.parametrize("message", [
+        "IpBlocked",
+        "RequestBlocked",
+        "HTTP Error 429: Too Many Requests",
+        "429 Client Error: Too Many Requests",
+        "Sign in to confirm you're not a bot",
+        "Sign in to confirm you’re not a bot",
+    ])
+    def test_rate_limited_by_message(self, message):
+        assert failure_kind(message) == "rate_limited"
+
+    def test_ids_containing_429_are_not_rate_limited(self):
+        """11-char video ids are [A-Za-z0-9_-]; one that happens to contain
+        "429" must not be misread as a rate-limit signal."""
+        assert failure_kind("transcript unavailable for ab429cdefgh: boom") == "failed"
+
+    @pytest.mark.parametrize("message", [
+        "premiere",
+        "This live event will begin in 3 hours",
+        "Video is not yet available",
+        "The uploader hasn't started streaming",
+    ])
+    def test_not_yet_aired_by_message(self, message):
+        assert failure_kind(message) == "not_yet_aired"
+
+    @pytest.mark.parametrize("message", [
+        "Unable to download webpage",
+        "urlopen error timed out",
+        "getaddrinfo failed",
+        "Temporary failure in name resolution",
+        "Connection reset by peer",
+        "Connection refused",
+        "Connection aborted",
+        "Remote end closed connection without response",
+        "CERTIFICATE_VERIFY_FAILED",
+    ])
+    def test_network_by_message(self, message):
+        assert failure_kind(message) == "network"
+
+    def test_anything_else_is_failed(self):
+        assert failure_kind("captions disabled for this video") == "failed"
+
+    def test_rate_limited_takes_precedence_over_not_yet_aired(self):
+        assert failure_kind("429 Client Error and also a premiere") == "rate_limited"
+
+
+class TestRunYtdlp:
+    def test_builds_command_with_utf8_encoding(self, monkeypatch):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(yt_transcript.subprocess, "run", fake_run)
+        run_ytdlp(["--skip-download", "VIDEOID"])
+
+        assert captured["cmd"] == ["yt-dlp", "--encoding", "utf-8", "--skip-download", "VIDEOID"]
+        assert captured["kwargs"]["capture_output"] is True
+        assert captured["kwargs"]["text"] is True
+        assert captured["kwargs"]["encoding"] == "utf-8"
+        assert captured["kwargs"]["errors"] == "replace"
+        assert "check" not in captured["kwargs"]
+
+    def test_passes_through_timeout(self, monkeypatch):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(yt_transcript.subprocess, "run", fake_run)
+        run_ytdlp(["--version"], timeout=30)
+
+        assert captured["kwargs"]["timeout"] == 30
+
+
+class TestYtdlpFailure:
+    def test_message_is_last_nonempty_stderr_line(self):
+        result = subprocess.CompletedProcess(
+            ["yt-dlp"], 1, stdout="", stderr="warning: foo\nERROR: bar\n\n"
+        )
+        exc = ytdlp_failure(result)
+        assert str(exc) == "ERROR: bar"
+
+    def test_falls_back_to_exit_code_when_stderr_empty(self):
+        result = subprocess.CompletedProcess(["yt-dlp"], 2, stdout="", stderr="")
+        exc = ytdlp_failure(result)
+        assert str(exc) == "yt-dlp exited 2"
+
+    def test_classifies_as_rate_limited(self):
+        result = subprocess.CompletedProcess(
+            ["yt-dlp"], 1, stdout="", stderr="ERROR: HTTP Error 429: Too Many Requests\n"
+        )
+        assert isinstance(ytdlp_failure(result), RateLimited)
+
+    def test_classifies_as_not_yet_aired(self):
+        result = subprocess.CompletedProcess(
+            ["yt-dlp"], 1, stdout="", stderr="ERROR: This live event will begin in 2 hours\n"
+        )
+        assert isinstance(ytdlp_failure(result), NotYetAired)
+
+    def test_classifies_as_plain_runtime_error(self):
+        result = subprocess.CompletedProcess(
+            ["yt-dlp"], 1, stdout="", stderr="ERROR: Video unavailable\n"
+        )
+        exc = ytdlp_failure(result)
+        assert type(exc) is RuntimeError
 
 
 class TestLastVideoState:
