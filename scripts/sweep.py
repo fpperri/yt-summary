@@ -21,10 +21,10 @@ endpoints per IP (``HTTP 429`` / ``IpBlocked``). Requests are paced, a throttled
 video is retried after an exponential backoff, and the run gives up only after a
 long run of consecutive blocks — so it can be left to grind rather than babysat.
 
-Exit code: 0 nothing to report, or a failure alongside at least one successful
-ingest; 1 a video or a whole channel failed and nothing was ingested; 2 the
-run itself, or a whole channel's walk, gave up rate-limited without
-ingesting anything.
+Exit code: 2 if rate limiting cut the run short and work remains — the ingest
+loop gave up, or any channel walk came back blocked — regardless of how many
+videos were ingested first; else 1 if a video or a whole channel failed and
+nothing was ingested; else 0.
 """
 import argparse
 import os
@@ -81,37 +81,73 @@ def collect_candidates(channels, since_days, limit_per_channel=None, stop_after_
     newest tab order.
 
     ``channels_failed`` counts channels that raised (list_channel exceptions
-    propagate through ``window_channel``) rather than folding them silently
-    into "nothing to do" — a manifest that only ever hits dead channels
-    should not look identical to a clean sweep. A channel walk that raised
-    because YouTube rate-limited it is also counted in ``channels_blocked``,
-    so the caller can tell an IP block apart from a channel that is simply
-    gone.
+    propagate through ``window_channel``), came back with a probe error, or
+    hit a rate-limited tab error, rather than folding any of those silently
+    into "nothing to do" — a manifest that only ever hits dead or blocked
+    channels should not look identical to a clean sweep. Any of the three
+    that YouTube rate-limited is also counted in ``channels_blocked``, so the
+    caller can tell an IP block apart from a channel that is simply gone —
+    and, once one channel comes back blocked, the walk stops polling the rest
+    of the manifest outright rather than keep hammering a throttled IP; the
+    candidates already collected still go on to be ingested.
     """
     import datetime
 
     cutoff = (datetime.date.today() - datetime.timedelta(days=since_days)).isoformat()
     seen, candidates, channels_failed, channels_blocked = set(), [], 0, 0
 
-    for channel in channels:
+    for position, channel in enumerate(channels):
+        channel_blocked = False
+        probe_error = None
+
+        def _on_tab_error(tab, err, c=channel):
+            nonlocal channel_blocked
+            log(f"TAB-FAIL {c} /{tab}: {err}", logpath)
+            if yt.failure_kind(err) == "rate_limited":
+                channel_blocked = True
+
+        def _on_probe_error(exc):
+            nonlocal probe_error
+            probe_error = exc
+
         try:
             videos = cv.window_channel(
                 channel, cutoff, stop_after_old, probe_pace, limit_per_tab=max_listed,
-                on_tab_error=lambda tab, err, c=channel: log(f"TAB-FAIL {c} /{tab}: {err}", logpath),
+                on_tab_error=_on_tab_error,
                 on_rss_miss=lambda exc, c=channel: log(
                     f"RSS-MISS {c}: {exc} — dating each video individually", logpath),
                 on_cap_hit=lambda tab, limit, c=channel: log(
                     f"CAP-HIT {c} /{tab}: listing stopped at {limit} with its oldest video "
                     "still in the window — raise --max-listed (0 = unlimited)", logpath),
+                on_probe_error=_on_probe_error,
             )
         except Exception as exc:
             channels_failed += 1
             rate_limited = yt.failure_kind(exc) == "rate_limited"
             if rate_limited:
                 channels_blocked += 1
+                channel_blocked = True
             suffix = " (rate limited)" if rate_limited else ""
             log(f"CHANNEL-FAIL {channel}{suffix}: {exc}", logpath)
+            if channel_blocked:
+                remaining = len(channels) - position - 1
+                log(f"BLOCKED while polling — {remaining} channel(s) not polled; "
+                    "rerun to resume", logpath)
+                break
             continue
+
+        if probe_error is not None:
+            channels_failed += 1
+            rate_limited = yt.failure_kind(probe_error) == "rate_limited"
+            if rate_limited:
+                channels_blocked += 1
+                channel_blocked = True
+            suffix = " (rate limited)" if rate_limited else ""
+            log(f"CHANNEL-FAIL {channel}{suffix}: {probe_error} — keeping {len(videos)} "
+                "video(s) already dated", logpath)
+        elif channel_blocked:
+            channels_failed += 1
+            channels_blocked += 1
 
         if limit_per_channel is not None:
             videos = videos[:limit_per_channel]
@@ -124,6 +160,12 @@ def collect_candidates(channels, since_days, limit_per_channel=None, stop_after_
             candidates.append({**video, "channel_url": channel})
             fresh += 1
         log(f"CHANNEL {channel}: {fresh} in window", logpath)
+
+        if channel_blocked:
+            remaining = len(channels) - position - 1
+            log(f"BLOCKED while polling — {remaining} channel(s) not polled; "
+                "rerun to resume", logpath)
+            break
 
     return candidates, channels_failed, channels_blocked
 
@@ -215,12 +257,13 @@ def sweep(manifest, output_dir=DEFAULT_OUTPUT_DIR, since_days=7, limit_per_chann
 
 
 def exit_code(result) -> int:
-    # 2 = gave up rate-limited (either the ingest loop itself or a whole
-    # channel walk), so a scheduled wrapper can tell "the IP is blocked,
-    # nothing was done" apart from "nothing new to fetch" (0); 1 flags a run
+    # 2 = rate limiting cut the run short and work remains — the ingest loop
+    # gave up, or any channel walk was blocked — even when videos were
+    # ingested before the block hit, since a scheduled wrapper still needs to
+    # know the IP is blocked and channels are left un-walked; 1 flags a run
     # that produced no ingests despite a video or a whole channel failing for
     # some other reason, so a wrapper doesn't have to parse the log to notice.
-    if result["blocked"] or (result["channels_blocked"] and not result["ingested"]):
+    if result["blocked"] or result["channels_blocked"]:
         return 2
     if (result["failed"] or result["channels_failed"]) and not result["ingested"]:
         return 1
@@ -228,12 +271,7 @@ def exit_code(result) -> int:
 
 
 def main():
-    # A piped stdout defaults to cp1252 on Windows; a title or channel name
-    # containing non-cp1252 characters would otherwise crash print() with a
-    # UnicodeEncodeError instead of just printing it.
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8")
+    yt.utf8_stdio()
 
     parser = argparse.ArgumentParser(description="Sweep a channel manifest and ingest new videos")
     parser.add_argument("manifest", help="Path to the channel manifest file")

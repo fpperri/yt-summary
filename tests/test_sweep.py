@@ -298,6 +298,99 @@ class TestSweep:
         out = capsys.readouterr().out
         assert "CAP-HIT" in out and "/shorts" in out and "42" in out and "--max-listed" in out
 
+    def test_probe_error_rate_limited_keeps_already_dated_videos(self, tmp_path, monkeypatch, capsys):
+        """A probe raising mid-walk must not throw away videos the walk had
+        already dated before the block hit — only the walk itself stops."""
+        def probing_window_channel(url, cutoff, stop_after_old=5, probe_pace=1.0,
+                                   limit_per_tab=None, on_tab_error=None, on_rss_miss=None,
+                                   on_cap_hit=None, on_probe_error=None, **kwargs):
+            on_probe_error(sweep_module.yt.RateLimited("HTTP Error 429: Too Many Requests"))
+            return [{"video_id": "aaaaaaaaaaa", "title": "one", "tab": "videos"}]
+
+        monkeypatch.setattr(sweep_module.cv, "window_channel", probing_window_channel)
+        result = sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, dry_run=True)
+
+        assert result["channels_failed"] == 1
+        assert result["channels_blocked"] == 1
+        assert [c["video_id"] for c in result["candidates"]] == ["aaaaaaaaaaa"]
+        out = capsys.readouterr().out
+        assert "CHANNEL-FAIL" in out and "rate limited" in out.lower()
+        assert "keeping 1 video" in out
+
+    def test_probe_error_network_is_not_counted_as_blocked(self, tmp_path, monkeypatch, capsys):
+        def probing_window_channel(url, cutoff, stop_after_old=5, probe_pace=1.0,
+                                   limit_per_tab=None, on_tab_error=None, on_rss_miss=None,
+                                   on_cap_hit=None, on_probe_error=None, **kwargs):
+            on_probe_error(RuntimeError("urlopen error timed out"))
+            return []
+
+        monkeypatch.setattr(sweep_module.cv, "window_channel", probing_window_channel)
+        result = sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, dry_run=True)
+
+        assert result["channels_failed"] == 1
+        assert result["channels_blocked"] == 0
+        out = capsys.readouterr().out
+        assert "CHANNEL-FAIL" in out
+        assert "rate limited" not in out.lower()
+
+    def test_rate_limited_tab_error_counts_channel_blocked(self, tmp_path, monkeypatch, capsys):
+        """/videos 429ing while /shorts lists fine doesn't raise out of
+        list_channel, but it is still an IP block and must count as one."""
+        def half_blocked_window_channel(url, cutoff, stop_after_old=5, probe_pace=1.0,
+                                        limit_per_tab=None, on_tab_error=None, on_rss_miss=None,
+                                        on_cap_hit=None, on_probe_error=None, **kwargs):
+            on_tab_error("videos", "HTTP Error 429: Too Many Requests")
+            return [{"video_id": "aaaaaaaaaaa", "title": "short", "tab": "shorts"}]
+
+        monkeypatch.setattr(sweep_module.cv, "window_channel", half_blocked_window_channel)
+        result = sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, dry_run=True)
+
+        assert result["channels_failed"] == 1
+        assert result["channels_blocked"] == 1
+        assert [c["video_id"] for c in result["candidates"]] == ["aaaaaaaaaaa"]
+        assert "TAB-FAIL" in capsys.readouterr().out
+
+    def test_stops_polling_remaining_channels_once_one_is_blocked(self, tmp_path, monkeypatch, capsys):
+        """A blocked IP stays hot across the rest of the manifest unless the
+        walk stops polling as soon as the first channel comes back blocked."""
+        manifest = tmp_path / "channels.txt"
+        manifest.write_text("@alpha\n@beta\n@gamma\n", encoding="utf-8")
+
+        def blocked_first(url, cutoff, stop_after_old=5, probe_pace=1.0, limit_per_tab=None,
+                          on_tab_error=None, on_rss_miss=None, on_cap_hit=None,
+                          on_probe_error=None, **kwargs):
+            if url.endswith("alpha"):
+                on_probe_error(sweep_module.yt.RateLimited("HTTP Error 429: Too Many Requests"))
+                return [{"video_id": "aaaaaaaaaaa", "title": "one", "tab": "videos"}]
+            raise AssertionError(f"must not poll {url} once alpha was blocked")
+
+        monkeypatch.setattr(sweep_module.cv, "window_channel", blocked_first)
+        result = sweep(manifest, tmp_path / "out", since_days=3650, dry_run=True)
+
+        assert [c["video_id"] for c in result["candidates"]] == ["aaaaaaaaaaa"]
+        out = capsys.readouterr().out
+        assert "BLOCKED while polling" in out
+        assert "2 channel(s) not polled" in out
+
+    def test_stops_polling_after_a_rate_limited_exception_too(self, tmp_path, monkeypatch, capsys):
+        manifest = tmp_path / "channels.txt"
+        manifest.write_text("@alpha\n@beta\n", encoding="utf-8")
+
+        def raise_on_alpha(url, cutoff, stop_after_old=5, probe_pace=1.0, limit_per_tab=None,
+                           on_tab_error=None, on_rss_miss=None, on_cap_hit=None,
+                           on_probe_error=None, **kwargs):
+            if url.endswith("alpha"):
+                raise sweep_module.yt.RateLimited("HTTP Error 429: Too Many Requests")
+            raise AssertionError(f"must not poll {url} once alpha was blocked")
+
+        monkeypatch.setattr(sweep_module.cv, "window_channel", raise_on_alpha)
+        result = sweep(manifest, tmp_path / "out", since_days=3650, dry_run=True)
+
+        assert result["channels_blocked"] == 1
+        out = capsys.readouterr().out
+        assert "BLOCKED while polling" in out
+        assert "1 channel(s) not polled" in out
+
     def test_fallback_slug_is_noted_in_the_ok_log_line(self, tmp_path, monkeypatch, capsys):
         self.stub_channel(monkeypatch, [{"video_id": "aaaaaaaaaaa", "title": "one", "tab": "videos"}])
         monkeypatch.setattr(sweep_module, "ingest",
@@ -336,5 +429,7 @@ class TestExitCode:
     def test_channels_blocked_with_nothing_ingested_is_2(self):
         assert sweep_module.exit_code(self.result(channels_blocked=1)) == 2
 
-    def test_channels_blocked_alongside_a_successful_ingest_is_0(self):
-        assert sweep_module.exit_code(self.result(channels_blocked=1, ingested=1)) == 0
+    def test_channels_blocked_alongside_a_successful_ingest_is_still_2(self):
+        """A blocked IP means channels are still un-walked no matter how many
+        videos got ingested before the walk hit the block."""
+        assert sweep_module.exit_code(self.result(channels_blocked=1, ingested=1)) == 2
