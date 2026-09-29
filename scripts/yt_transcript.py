@@ -309,13 +309,21 @@ def _preferred_vtt(filenames: list[str], manual_langs=()) -> str | None:
 
 
 def via_ytdlp(video_id: str) -> list[tuple[float, str]]:
-    """Fetch auto-subs via yt-dlp and parse the resulting WebVTT."""
+    """Fetch auto-subs via yt-dlp and parse the resulting WebVTT.
+
+    ``--skip-download`` still leaves yt-dlp doing format selection, and when
+    YouTube withholds formats entirely that selection errors out ("Requested
+    format is not available") before a single subtitle file is written —
+    ``--ignore-no-formats-error`` is what lets the run continue to the
+    caption download anyway.
+    """
     workdir = tempfile.mkdtemp()
     try:
         base = os.path.join(workdir, video_id)
         cmd = [
             "--skip-download", "--write-auto-subs", "--write-subs", "--write-info-json",
             "--sub-lang", "en.*", "--sub-format", "vtt",
+            "--ignore-no-formats-error",
             "--sleep-requests", "1", "--no-warnings",
             "-o", base + ".%(ext)s",
             f"https://www.youtube.com/watch?v={video_id}",
@@ -356,11 +364,16 @@ def fetch_segments(video_id: str, languages=None) -> tuple[list[tuple[float, str
     bulk runs once the API endpoint is throttled, since a rejected call is still a
     request that keeps the rate limit hot.
 
-    When both sources fail, the exception raised is typed by whichever source
-    saw the more actionable signal — a caller (a sweep's retry loop) needs to
-    tell "throttled, back off and retry" and "premiere, try again later" apart
-    from a plain failure, and either source's error can carry that signal even
-    when the other's doesn't.
+    When both sources fail, the exception raised is typed by yt-dlp's verdict
+    first: it is the one still talking to YouTube's regular (non-API) surface,
+    so when it lands on a definitive answer — rate-limited, not-yet-aired, or
+    a plain failure such as "no vtt written" (no English captions, or a
+    private/deleted video) — that answer stands even when the API's failure
+    looked like a rate limit too. Reading a blocked API plus a definitive
+    yt-dlp "no captions" as a rate limit would make a caller's retry loop back
+    off for hours on a video that was never going to get captions. Only when
+    yt-dlp itself saw nothing but a transport failure (no definitive verdict)
+    does the API's classification decide.
     """
     if os.environ.get("YT_NO_API"):
         return via_ytdlp(video_id), "ytdlp"
@@ -374,10 +387,19 @@ def fetch_segments(video_id: str, languages=None) -> tuple[list[tuple[float, str
                 f"transcript unavailable for {video_id}: "
                 f"api={api_error!r} ytdlp={ytdlp_error!r}"
             )
-            kinds = {failure_kind(api_error), failure_kind(ytdlp_error)}
-            if "rate_limited" in kinds:
+            ytdlp_kind = failure_kind(ytdlp_error)
+            if ytdlp_kind == "rate_limited":
                 raise RateLimited(message) from ytdlp_error
-            if "not_yet_aired" in kinds:
+            if ytdlp_kind == "not_yet_aired":
+                raise NotYetAired(message) from ytdlp_error
+            if ytdlp_kind == "network":
+                api_kind = failure_kind(api_error)
+                if api_kind == "rate_limited":
+                    raise RateLimited(message) from ytdlp_error
+                if api_kind == "not_yet_aired":
+                    raise NotYetAired(message) from ytdlp_error
+                raise RuntimeError(message) from ytdlp_error
+            if failure_kind(api_error) == "not_yet_aired":
                 raise NotYetAired(message) from ytdlp_error
             raise RuntimeError(message) from ytdlp_error
 
@@ -393,16 +415,24 @@ def get_transcript(video_id: str, with_timestamps: bool = False, lang_priority=N
     return render(segments, with_timestamps)
 
 
+def utf8_stdio() -> None:
+    """Reconfigure stdout and stderr to utf-8 where the stream supports it.
+
+    A piped stdout defaults to cp1252 on Windows; a transcript containing
+    non-cp1252 characters would otherwise crash print() with a
+    UnicodeEncodeError instead of just printing the text. Shared by every
+    script's main() in this plugin so the fix lives in one place.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+
+
 def main():
     import argparse
     import time
 
-    # A piped stdout defaults to cp1252 on Windows; a transcript containing
-    # non-cp1252 characters would otherwise crash print() with a
-    # UnicodeEncodeError instead of just printing the text.
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8")
+    utf8_stdio()
 
     parser = argparse.ArgumentParser(description="Fetch a YouTube transcript")
     parser.add_argument("url", help="YouTube URL or video ID")

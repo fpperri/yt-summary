@@ -304,6 +304,31 @@ class TestViaYtdlp:
 
         assert yt_transcript.via_ytdlp("vid") == [(1.0, "plain")]
 
+    def test_passes_ignore_no_formats_error(self, monkeypatch, tmp_path):
+        """--skip-download still makes yt-dlp run format selection, and
+        YouTube withholding formats fails that selection before any subtitle
+        is written; this flag is the only way past it."""
+        def fake_mkdtemp():
+            d = tmp_path / "work"
+            d.mkdir()
+            return str(d)
+
+        captured = {}
+
+        def fake_run(args, timeout=None):
+            captured["args"] = args
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(yt_transcript.tempfile, "mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr(yt_transcript, "_impersonate_target", lambda: "")
+        monkeypatch.setattr(yt_transcript, "run_ytdlp", fake_run)
+
+        with pytest.raises(RuntimeError, match="no vtt"):
+            yt_transcript.via_ytdlp("vid")
+
+        assert "--ignore-no-formats-error" in captured["args"]
+
+
 class TestRender:
     segments = [(0.0, "alpha"), (65.0, "beta")]
 
@@ -375,17 +400,90 @@ class TestFetchSegments:
         with pytest.raises(NotYetAired):
             fetch_segments(VID)
 
-    def test_rate_limited_wins_when_either_source_saw_it(self, monkeypatch):
-        """The api failure alone can carry the rate-limit signal even when
-        yt-dlp's failure is unrelated."""
+    def test_ytdlps_definitive_failure_beats_an_api_rate_limit_signal(self, monkeypatch):
+        """yt-dlp answering "no vtt written" is a definitive verdict (no
+        English captions, or the video is private/deleted) even though the
+        API call it also tried was blocked — that must not be read as a
+        retry-forever rate limit."""
         monkeypatch.delenv("YT_NO_API", raising=False)
         monkeypatch.setattr(
             yt_transcript, "via_api",
-            lambda v, l=None: (_ for _ in ()).throw(RuntimeError("429 Client Error")),
+            lambda v, l=None: (_ for _ in ()).throw(RuntimeError("RequestBlocked")),
         )
         monkeypatch.setattr(
             yt_transcript, "via_ytdlp",
             lambda v: (_ for _ in ()).throw(RuntimeError("no vtt written")),
+        )
+        with pytest.raises(RuntimeError) as exc_info:
+            fetch_segments(VID)
+        assert not isinstance(exc_info.value, RateLimited)
+
+    def test_ytdlp_network_failure_falls_back_to_an_api_rate_limit(self, monkeypatch):
+        """yt-dlp saw only a transport failure, no definitive verdict, so the
+        API's rate-limit signal is what decides."""
+        monkeypatch.delenv("YT_NO_API", raising=False)
+        monkeypatch.setattr(
+            yt_transcript, "via_api",
+            lambda v, l=None: (_ for _ in ()).throw(RuntimeError("RequestBlocked")),
+        )
+        monkeypatch.setattr(
+            yt_transcript, "via_ytdlp",
+            lambda v: (_ for _ in ()).throw(RuntimeError("Connection reset by peer")),
+        )
+        with pytest.raises(RateLimited):
+            fetch_segments(VID)
+
+    def test_ytdlp_network_failure_falls_back_to_an_api_not_yet_aired(self, monkeypatch):
+        monkeypatch.delenv("YT_NO_API", raising=False)
+        monkeypatch.setattr(
+            yt_transcript, "via_api",
+            lambda v, l=None: (_ for _ in ()).throw(RuntimeError("This live event will begin in 2 hours")),
+        )
+        monkeypatch.setattr(
+            yt_transcript, "via_ytdlp",
+            lambda v: (_ for _ in ()).throw(RuntimeError("Connection reset by peer")),
+        )
+        with pytest.raises(NotYetAired):
+            fetch_segments(VID)
+
+    def test_ytdlp_network_failure_with_plain_api_failure_is_plain_runtime_error(self, monkeypatch):
+        monkeypatch.delenv("YT_NO_API", raising=False)
+        monkeypatch.setattr(
+            yt_transcript, "via_api",
+            lambda v, l=None: (_ for _ in ()).throw(RuntimeError("captions disabled for this video")),
+        )
+        monkeypatch.setattr(
+            yt_transcript, "via_ytdlp",
+            lambda v: (_ for _ in ()).throw(RuntimeError("Connection reset by peer")),
+        )
+        with pytest.raises(RuntimeError) as exc_info:
+            fetch_segments(VID)
+        assert not isinstance(exc_info.value, (RateLimited, NotYetAired))
+
+    def test_ytdlp_definitive_failure_falls_back_to_an_api_not_yet_aired(self, monkeypatch):
+        """Neither source gave a rate-limit or premiere verdict on its own
+        terms except the API's — a plain yt-dlp failure doesn't outrank it."""
+        monkeypatch.delenv("YT_NO_API", raising=False)
+        monkeypatch.setattr(
+            yt_transcript, "via_api",
+            lambda v, l=None: (_ for _ in ()).throw(RuntimeError("Video is not yet available")),
+        )
+        monkeypatch.setattr(
+            yt_transcript, "via_ytdlp",
+            lambda v: (_ for _ in ()).throw(RuntimeError("no vtt written")),
+        )
+        with pytest.raises(NotYetAired):
+            fetch_segments(VID)
+
+    def test_both_sources_rate_limited_is_rate_limited(self, monkeypatch):
+        monkeypatch.delenv("YT_NO_API", raising=False)
+        monkeypatch.setattr(
+            yt_transcript, "via_api",
+            lambda v, l=None: (_ for _ in ()).throw(RuntimeError("HTTP Error 429: Too Many Requests")),
+        )
+        monkeypatch.setattr(
+            yt_transcript, "via_ytdlp",
+            lambda v: (_ for _ in ()).throw(RuntimeError("HTTP Error 429: Too Many Requests")),
         )
         with pytest.raises(RateLimited):
             fetch_segments(VID)
@@ -525,6 +623,30 @@ class TestYtdlpFailure:
         )
         exc = ytdlp_failure(result)
         assert type(exc) is RuntimeError
+
+
+class TestUtf8Stdio:
+    def test_reconfigures_stdout_and_stderr_to_utf8(self, monkeypatch):
+        calls = []
+
+        class FakeStream:
+            def reconfigure(self, encoding):
+                calls.append(encoding)
+
+        monkeypatch.setattr(yt_transcript.sys, "stdout", FakeStream())
+        monkeypatch.setattr(yt_transcript.sys, "stderr", FakeStream())
+        yt_transcript.utf8_stdio()
+        assert calls == ["utf-8", "utf-8"]
+
+    def test_skips_a_stream_with_no_reconfigure(self, monkeypatch):
+        """A captured/piped stream in a test harness (e.g. pytest's capsys)
+        may not expose reconfigure; this must not crash on it."""
+        class BareStream:
+            pass
+
+        monkeypatch.setattr(yt_transcript.sys, "stdout", BareStream())
+        monkeypatch.setattr(yt_transcript.sys, "stderr", BareStream())
+        yt_transcript.utf8_stdio()
 
 
 class TestLastVideoState:
