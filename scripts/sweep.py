@@ -21,6 +21,13 @@ endpoints per IP (``HTTP 429`` / ``IpBlocked``). Requests are paced, a throttled
 video is retried after an exponential backoff, and the run gives up only after a
 long run of consecutive blocks — so it can be left to grind rather than babysat.
 
+A definitive failure ("failed" or "network" in ``yt_transcript.failure_kind``
+terms) gets one immediate retry, after the normal pace, before it is counted
+lost — a fair few of these clear on the second attempt. A rate-limited or
+not-yet-aired verdict is untouched by this: those already have their own
+handling (the backoff loop, and the next-sweep pickup) and are never retried
+here.
+
 Exit code: 2 if rate limiting cut the run short and work remains — the ingest
 loop gave up, or any channel walk came back blocked — regardless of how many
 videos were ingested first; else 1 if a video or a whole channel failed and
@@ -170,6 +177,22 @@ def collect_candidates(channels, since_days, limit_per_channel=None, stop_after_
     return candidates, channels_failed, channels_blocked
 
 
+def _ingest_once_with_retry(video_id, output_dir, hints, ingested_map, pace, logpath):
+    """Call ``ingest`` once; on a "failed" or "network" verdict, wait the
+    normal pace and try that same video exactly once more before letting the
+    exception through. A rate-limited or not-yet-aired verdict is raised
+    straight through untouched — those are handled by the caller's own
+    backoff loop and next-sweep pickup, not by this retry."""
+    try:
+        return ingest(video_id, output_dir, hints=hints, ingested=ingested_map)
+    except Exception as exc:
+        if yt.failure_kind(exc) not in ("failed", "network"):
+            raise
+        log(f"RETRY {video_id}: {exc}", logpath)
+        time.sleep(pace)
+        return ingest(video_id, output_dir, hints=hints, ingested=ingested_map)
+
+
 def sweep(manifest, output_dir=DEFAULT_OUTPUT_DIR, since_days=7, limit_per_channel=None,
           pace=8.0, max_block=30, dry_run=False, logpath=None, stop_after_old=5,
           probe_pace=1.0, max_listed=cv.DEFAULT_LISTING_CAP):
@@ -206,7 +229,7 @@ def sweep(manifest, output_dir=DEFAULT_OUTPUT_DIR, since_days=7, limit_per_chann
         hints = {"title": candidate.get("title", ""), "channel": candidate.get("channel", ""),
                  "published": candidate.get("published", "")}
         try:
-            result = ingest(video_id, output_dir, hints=hints, ingested=ingested_map)
+            result = _ingest_once_with_retry(video_id, output_dir, hints, ingested_map, pace, logpath)
         except Exception as exc:
             message = str(exc)
             kind = yt.failure_kind(exc)

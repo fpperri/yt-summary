@@ -183,7 +183,8 @@ class TestSweep:
         monkeypatch.setattr(sweep_module.time, "sleep", lambda s: None)
 
         result = sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0)
-        assert attempts == ["a429bcdefgh", "bbbbbbbbbbb"]  # moved on, did not retry
+        # retried once (a "failed" verdict), then moved on rather than backing off
+        assert attempts == ["a429bcdefgh", "a429bcdefgh", "bbbbbbbbbbb"]
         assert result["failed"] == 1 and result["ingested"] == 1
         assert result["blocked"] is False
 
@@ -390,6 +391,75 @@ class TestSweep:
         out = capsys.readouterr().out
         assert "BLOCKED while polling" in out
         assert "1 channel(s) not polled" in out
+
+    def test_a_failed_video_is_retried_once_and_then_succeeds(self, tmp_path, monkeypatch, capsys):
+        """A definitive failure ("failed" or "network") gets one immediate
+        retry before it is counted lost — most of what looks like a bad batch
+        clears on the second try."""
+        self.stub_channel(monkeypatch, [{"video_id": "aaaaaaaaaaa", "title": "one", "tab": "videos"}])
+        calls = []
+
+        def flaky(video_id, output_dir, hints=None, ingested=None):
+            calls.append(video_id)
+            if len(calls) == 1:
+                raise RuntimeError("transcripts are disabled")
+            return {"slug": "s", "skipped": False, "path": "p"}
+
+        monkeypatch.setattr(sweep_module, "ingest", flaky)
+        monkeypatch.setattr(sweep_module.time, "sleep", lambda s: None)
+        result = sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0)
+
+        assert calls == ["aaaaaaaaaaa", "aaaaaaaaaaa"]
+        assert result["ingested"] == 1
+        assert result["failed"] == 0
+        assert "RETRY aaaaaaaaaaa" in capsys.readouterr().out
+
+    def test_a_failed_video_that_fails_again_on_retry_is_counted_failed(self, tmp_path, monkeypatch):
+        self.stub_channel(monkeypatch, [{"video_id": "aaaaaaaaaaa", "title": "one", "tab": "videos"}])
+        calls = []
+
+        def always_fails(video_id, output_dir, hints=None, ingested=None):
+            calls.append(video_id)
+            raise RuntimeError("transcripts are disabled")
+
+        monkeypatch.setattr(sweep_module, "ingest", always_fails)
+        monkeypatch.setattr(sweep_module.time, "sleep", lambda s: None)
+        result = sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0)
+
+        assert calls == ["aaaaaaaaaaa", "aaaaaaaaaaa"]
+        assert result["failed"] == 1
+        assert result["ingested"] == 0
+
+    def test_rate_limited_failure_is_not_retried_by_the_failed_path(self, tmp_path, monkeypatch):
+        """Rate limiting already has its own backoff-and-repeat loop; this
+        retry is only for a definitive "failed"/"network" verdict."""
+        self.stub_channel(monkeypatch, [{"video_id": "aaaaaaaaaaa", "title": "one", "tab": "videos"}])
+        calls = []
+
+        def blocked(video_id, output_dir, hints=None, ingested=None):
+            calls.append(video_id)
+            raise RuntimeError("HTTP Error 429: Too Many Requests")
+
+        monkeypatch.setattr(sweep_module, "ingest", blocked)
+        monkeypatch.setattr(sweep_module.time, "sleep", lambda s: None)
+        sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0, max_block=2)
+
+        assert "RETRY" not in "".join(calls)  # sanity: calls holds ids, not log text
+        assert calls == ["aaaaaaaaaaa"] * 2  # the existing backoff loop, not the new retry
+
+    def test_premiere_failure_is_not_retried_by_the_failed_path(self, tmp_path, monkeypatch):
+        self.stub_channel(monkeypatch, [{"video_id": "aaaaaaaaaaa", "title": "soon", "tab": "videos"}])
+        calls = []
+
+        def premiere(video_id, output_dir, hints=None, ingested=None):
+            calls.append(video_id)
+            raise RuntimeError("ERROR: This live event will begin in 2 hours")
+
+        monkeypatch.setattr(sweep_module, "ingest", premiere)
+        result = sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0)
+
+        assert calls == ["aaaaaaaaaaa"]
+        assert result["skipped"] == 1
 
     def test_fallback_slug_is_noted_in_the_ok_log_line(self, tmp_path, monkeypatch, capsys):
         self.stub_channel(monkeypatch, [{"video_id": "aaaaaaaaaaa", "title": "one", "tab": "videos"}])
