@@ -106,11 +106,6 @@ def ingested_videos(output_dir) -> dict[str, Path]:
     return found
 
 
-def ingested_video_ids(output_dir) -> set[str]:
-    """Every video id already ingested under ``output_dir``."""
-    return set(ingested_videos(output_dir))
-
-
 def resolve_target(output_dir, slug: str, video_id: str) -> tuple[Path, bool]:
     """Pick the folder for this video and say whether it is already ingested.
 
@@ -247,7 +242,9 @@ def main():
         if result["fallback_slug"]:
             print(
                 f"WARN {result['video_id']}: no title or channel resolved; "
-                f"filed under {result['slug']}", file=sys.stderr,
+                f"filed under {result['slug']}. Delete that folder and rerun "
+                "once metadata resolves (--force rewrites it in place).",
+                file=sys.stderr,
             )
 
 

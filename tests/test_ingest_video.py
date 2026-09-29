@@ -1,11 +1,12 @@
 from types import SimpleNamespace
 
+import pytest
+
 import ingest_video
 from ingest_video import (
     build_document,
     fetch_metadata,
     ingest,
-    ingested_video_ids,
     ingested_videos,
     resolve_target,
     transcript_video_id,
@@ -33,20 +34,15 @@ class TestTranscriptVideoId:
         assert transcript_video_id(tmp_path / "nope.md") is None
 
 
-class TestIngestedVideoIds:
-    def test_collects_across_folders(self, tmp_path):
-        write_source_set(tmp_path, "a-one", VID)
-        write_source_set(tmp_path, "b-two", OTHER)
-        assert ingested_video_ids(tmp_path) == {VID, OTHER}
-
-    def test_empty_directory(self, tmp_path):
-        assert ingested_video_ids(tmp_path) == set()
-
-
 class TestIngestedVideos:
     def test_maps_id_to_its_folder(self, tmp_path):
         folder = write_source_set(tmp_path, "a-one", VID)
         assert ingested_videos(tmp_path) == {VID: folder}
+
+    def test_collects_across_folders(self, tmp_path):
+        write_source_set(tmp_path, "a-one", VID)
+        write_source_set(tmp_path, "b-two", OTHER)
+        assert set(ingested_videos(tmp_path)) == {VID, OTHER}
 
     def test_empty_directory(self, tmp_path):
         assert ingested_videos(tmp_path) == {}
@@ -107,9 +103,15 @@ class TestBuildDocument:
         assert ".cortex" not in doc
         assert "inquiry/sources" not in doc
 
-    def test_quotes_the_video_id_so_it_cannot_parse_as_a_yaml_number(self):
-        doc = build_document(VID, "T", "C", "", "2026-09-01", "api", [(0.0, "x")])
-        assert f'video_id: "{VID}"' in doc
+    def test_numeric_looking_video_id_survives_yaml_parsing_as_a_string(self):
+        yaml = pytest.importorskip("yaml")
+        for numeric_looking_id in ("12345678901", "1e123456789"):
+            doc = build_document(
+                numeric_looking_id, "T", "C", "", "2026-09-01", "api", [(0.0, "x")],
+            )
+            frontmatter = doc.split("---")[1]
+            parsed = yaml.safe_load(frontmatter)
+            assert parsed["video_id"] == numeric_looking_id
 
     def test_quoted_video_id_round_trips_through_transcript_video_id(self, tmp_path):
         doc = build_document(VID, "T", "C", "", "2026-09-01", "api", [(0.0, "x")])
