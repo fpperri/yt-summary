@@ -182,11 +182,14 @@ def _ingest_once_with_retry(video_id, output_dir, hints, ingested_map, pace, log
     normal pace and try that same video exactly once more before letting the
     exception through. A rate-limited or not-yet-aired verdict is raised
     straight through untouched — those are handled by the caller's own
-    backoff loop and next-sweep pickup, not by this retry."""
+    backoff loop and next-sweep pickup, not by this retry. So is a typed
+    ``TranscriptUnavailable``: a source gave a definitive "no transcript"
+    answer, which a same-video retry can never turn around, so retrying it
+    only spends an extra request and pace wait for nothing."""
     try:
         return ingest(video_id, output_dir, hints=hints, ingested=ingested_map)
     except Exception as exc:
-        if yt.failure_kind(exc) not in ("failed", "network"):
+        if isinstance(exc, yt.TranscriptUnavailable) or yt.failure_kind(exc) not in ("failed", "network"):
             raise
         log(f"RETRY {video_id}: {exc}", logpath)
         time.sleep(pace)

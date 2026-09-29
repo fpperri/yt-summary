@@ -1,4 +1,5 @@
 import sweep as sweep_module
+import yt_transcript as yt
 from sweep import read_manifest, sweep
 
 
@@ -430,7 +431,7 @@ class TestSweep:
         assert result["failed"] == 1
         assert result["ingested"] == 0
 
-    def test_rate_limited_failure_is_not_retried_by_the_failed_path(self, tmp_path, monkeypatch):
+    def test_rate_limited_failure_is_not_retried_by_the_failed_path(self, tmp_path, monkeypatch, capsys):
         """Rate limiting already has its own backoff-and-repeat loop; this
         retry is only for a definitive "failed"/"network" verdict."""
         self.stub_channel(monkeypatch, [{"video_id": "aaaaaaaaaaa", "title": "one", "tab": "videos"}])
@@ -444,8 +445,28 @@ class TestSweep:
         monkeypatch.setattr(sweep_module.time, "sleep", lambda s: None)
         sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0, max_block=2)
 
-        assert "RETRY" not in "".join(calls)  # sanity: calls holds ids, not log text
+        assert "RETRY" not in capsys.readouterr().out
         assert calls == ["aaaaaaaaaaa"] * 2  # the existing backoff loop, not the new retry
+
+    def test_a_definitively_unavailable_transcript_is_not_retried(self, tmp_path, monkeypatch):
+        """A typed TranscriptUnavailable (no captions, private/deleted video)
+        can never succeed on a same-video retry -- unlike a plain "failed"
+        message, which might just be a transient hiccup. Retrying it anyway
+        only costs an extra request and pace wait per video, on an IP that
+        may already be under throttling pressure."""
+        self.stub_channel(monkeypatch, [{"video_id": "aaaaaaaaaaa", "title": "one", "tab": "videos"}])
+        calls = []
+
+        def disabled(video_id, output_dir, hints=None, ingested=None):
+            calls.append(video_id)
+            raise yt.TranscriptUnavailable("transcripts are disabled")
+
+        monkeypatch.setattr(sweep_module, "ingest", disabled)
+        monkeypatch.setattr(sweep_module.time, "sleep", lambda s: None)
+        result = sweep(self.manifest(tmp_path), tmp_path / "out", since_days=3650, pace=0)
+
+        assert calls == ["aaaaaaaaaaa"]
+        assert result["failed"] == 1
 
     def test_premiere_failure_is_not_retried_by_the_failed_path(self, tmp_path, monkeypatch):
         self.stub_channel(monkeypatch, [{"video_id": "aaaaaaaaaaa", "title": "soon", "tab": "videos"}])

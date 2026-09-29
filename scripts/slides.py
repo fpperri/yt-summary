@@ -27,6 +27,7 @@ import glob
 import io
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -58,11 +59,13 @@ TILE_READ_W = 1600  # width the `tile` reading crops are upscaled to
 
 # Perceptual-hash grab size for de-duplication. A dHash compares each pixel to
 # its right neighbour, so it survives uniform dimming (an animation step that
-# only darkens the frame); the resolution is high enough that two light,
-# mostly-white text slides with different words land far apart in Hamming
-# distance instead of colliding on "mostly white". Calibrated against real
-# conference-talk footage, not just the synthetic test fixtures.
-HASH_W, HASH_H = 16, 16
+# only darkens the frame); the resolution has to be high enough that two
+# light, mostly-white text slides sharing a template but with different words
+# land far apart in Hamming distance instead of colliding on "mostly white" --
+# 16x16 wasn't: two such slides measured 8-9 bits apart, under the old default
+# threshold of 14. 32x32 pushes the same pair past 25 while still catching a
+# genuine dimmed repeat (measured ~11 bits at this size).
+HASH_W, HASH_H = 32, 32
 DEFAULT_DUP_THRESHOLD = 14
 
 WORKROOT_ENV = "SLIDES_WORKROOT"
@@ -219,7 +222,8 @@ def clamp_range(t0, t1, dur, margin=0.5):
     if t1 < t0:
         raise ValueError(
             f"clamped sample range is empty ({clock(t0)}..{clock(t1)}) -- "
-            "the requested range is entirely past the video's end"
+            "the requested range starts within the final "
+            f"{margin:g}s of the video, or past its end"
         )
     return t0, t1
 
@@ -378,6 +382,7 @@ def sheets(frames_dir, pattern, out_prefix, cols):
 
 
 def cmd_fetch(a):
+    need("yt-dlp")
     vid = transcript(a.dir)
     work = workdir(vid)
     fmt = f"bv[height<={a.height}][ext=mp4]/bv[height<={a.height}]"
@@ -420,11 +425,14 @@ def cmd_detect(a):
         print(f"  {i:3d} first={clock(g['first'])} t={g['sample']:.2f}")
         if dup_of[i] is not None:
             print(f"DUP {i} of={dup_of[i]}")
-        if g["n"] >= 3:
+        if g["n"] >= 2:
             print(f"BURST {i} first={clock(g['first'])} last={clock(g['last'])} n={g['n']} changes -- "
-                  f"resample: slides.py sample --dir {a.dir} --from {clock(g['first'])} "
-                  f"--to {clock(g['last'])} --fps 4 --crop {a.crop}")
-    for from_t, to_t in sparse_gaps([g["sample"] for g in groups], a.sparse):
+                  f"resample: slides.py sample --dir {shlex.quote(a.dir)} --from {g['first']:.2f} "
+                  f"--to {g['last'] + a.settle:.2f} --fps 4 --crop {shlex.quote(a.crop)}")
+    sample_seconds = [g["sample"] for g in groups]
+    if dur > 0:
+        sample_seconds = sample_seconds + [dur - 0.5]  # the tail stretch to the video's end is a gap too
+    for from_t, to_t in sparse_gaps(sample_seconds, a.sparse):
         print(f"SPARSE {clock(from_t)}..{clock(to_t)}: one sample in {to_t - from_t:.0f}s -- "
               f"try a lower --threshold, or `sample --from {clock(from_t)} --to {clock(to_t)}`")
 
@@ -535,9 +543,10 @@ def cmd_tile(a):
         base = os.path.splitext(os.path.basename(path))[0]
         for name, crop in tile_regions():
             out = os.path.join(tdir, f"{base}-{name}.jpg")
-            p = run([tool("ffmpeg"), "-v", "error", "-y", "-i", path, "-vf", crop, "-q:v", "3", out])
+            p = run([tool("ffmpeg"), "-v", "error", "-y", "-i", path, "-frames:v", "1", "-vf", crop,
+                     "-q:v", "3", out])
             if p.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
-                die(f"could not render the '{name}' reading crop for {path}")
+                die(f"could not render the '{name}' reading crop for {path}: {(p.stderr or '')[-300:]}")
             print(f"TILE={out}")
 
 
@@ -624,8 +633,6 @@ def main():
     a.dir = os.path.abspath(a.dir)
     try:
         a.fn(a)
-    except subprocess.CalledProcessError as e:
-        die(f"{os.path.basename(str(e.cmd[0]))} exited {e.returncode}")
     except Exception as e:
         die(str(e))
 

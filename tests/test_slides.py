@@ -171,6 +171,13 @@ class TestClampRange:
         with pytest.raises(ValueError):
             clamp_range(200.0, 300.0, dur=100.0)
 
+    def test_error_distinguishes_the_final_margin_from_truly_past_the_end(self):
+        """A --from that lands inside the video but within its last 0.5s
+        margin is not "entirely past the end" -- that phrase belongs to a
+        --from genuinely beyond the probed duration."""
+        with pytest.raises(ValueError, match="final"):
+            clamp_range(35.6, 40.0, dur=35.9)
+
 
 class TestSampleTimes:
     def test_generates_inclusive_of_the_end(self):
@@ -209,7 +216,7 @@ class TestSparseGaps:
 class TestDhashAndHamming:
     def test_identical_bytes_have_zero_distance(self):
         data = bytes((i * 7) % 256 for i in range(17 * 16))
-        assert hamming(dhash(data), dhash(data)) == 0
+        assert hamming(dhash(data, 17, 16), dhash(data, 17, 16)) == 0
 
     def test_ascending_and_descending_gradients_are_far_apart(self):
         w, h = 17, 16
@@ -368,6 +375,16 @@ class TestCmdFetch:
         with pytest.raises(RuntimeError):
             cmd_fetch(_mkargs(dir=str(folder), height=360))
 
+    def test_dies_clearly_when_yt_dlp_is_missing(self, tmp_path, monkeypatch):
+        """A missing yt-dlp must fail with this script's own clear message,
+        not surface as whatever raw OS error subprocess raises for a program
+        that isn't on PATH."""
+        folder = write_source(tmp_path)
+        monkeypatch.setenv(slides.WORKROOT_ENV, str(tmp_path / "workroot"))
+        monkeypatch.setattr(slides.shutil, "which", lambda name: None)
+        with pytest.raises(SystemExit, match="yt-dlp not found on PATH"):
+            cmd_fetch(_mkargs(dir=str(folder), height=360))
+
 
 class DetectFakeRun:
     """Fakes the ffmpeg/ffprobe subprocess boundary for cmd_detect: scene
@@ -403,8 +420,9 @@ class DetectFakeRun:
         raise AssertionError(f"unexpected command in test: {cmd}")
 
 
-HASH_A = bytes([col * 15 for col in range(17)] * 16)
-HASH_B = bytes([255 - col * 15 for col in range(17)] * 16)
+_HASH_GRAB_W, _HASH_GRAB_H = slides.HASH_W + 1, slides.HASH_H
+HASH_A = bytes([int(col * 255 / (_HASH_GRAB_W - 1)) for col in range(_HASH_GRAB_W)] * _HASH_GRAB_H)
+HASH_B = bytes([255 - b for b in HASH_A])
 
 
 class TestCmdDetect:
@@ -438,6 +456,65 @@ class TestCmdDetect:
         assert "DUP 2 of=1" in out
         assert "BURST 1 first=00:05 last=00:05 n=3 changes" in out
         assert "SPARSE" in out  # --sparse 1 makes every real gap here sparse
+
+    def test_a_two_change_flash_group_still_gets_a_burst_cue(self, tmp_path, monkeypatch, capsys):
+        """A one-second flash (a scene change in, then back out) merges into
+        a single group with n=2, not the n>=3 an animation build-up usually
+        produces. It still deserves a BURST cue -- without one, the flash's
+        own content is never sampled or flagged, only silently merged away."""
+        folder = self._setup(tmp_path, monkeypatch)
+        fake = DetectFakeRun(
+            change_times=[5.0, 5.3], dur=10.0,
+            hash_by_ss={"1.50": HASH_A, "6.80": HASH_B},
+        )
+        monkeypatch.setattr(slides, "run", fake)
+        cmd_detect(self._args(folder))
+        out = capsys.readouterr().out
+        assert "BURST 1 first=00:05 last=00:05 n=2 changes" in out
+
+    def test_burst_resample_command_quotes_a_dir_with_spaces(self, tmp_path, monkeypatch, capsys):
+        """A source folder with spaces in its path must survive a copy-paste
+        of the suggested resample command as one argument, not split apart."""
+        folder = self._setup(tmp_path, monkeypatch)
+        spaced = folder.parent / "chan title"
+        os.rename(folder, spaced)
+        fake = DetectFakeRun(
+            change_times=[5.0, 5.3], dur=10.0,
+            hash_by_ss={"1.50": HASH_A, "6.80": HASH_B},
+        )
+        monkeypatch.setattr(slides, "run", fake)
+        cmd_detect(self._args(spaced))
+        out = capsys.readouterr().out
+        assert f"--dir {slides.shlex.quote(str(spaced))}" in out
+
+    def test_burst_resample_command_uses_raw_seconds_not_truncated_clock(self, tmp_path, monkeypatch, capsys):
+        """The printed resample command must cover the whole burst span in
+        fractional seconds -- clock() truncates to whole seconds, which can
+        clip a sub-second slide (a scene change at 5.3s and another at 5.9s
+        both round down to the same "00:05") right out of the suggested
+        --from/--to range."""
+        folder = self._setup(tmp_path, monkeypatch)
+        fake = DetectFakeRun(
+            change_times=[4.9, 5.3, 5.9], dur=10.0,
+            hash_by_ss={"1.50": HASH_A, "7.40": HASH_B},
+        )
+        monkeypatch.setattr(slides, "run", fake)
+        cmd_detect(self._args(folder))
+        out = capsys.readouterr().out
+        assert "--from 4.90 --to 7.40 --fps 4" in out
+
+    def test_sparse_checks_the_tail_gap_to_the_probed_duration(self, tmp_path, monkeypatch, capsys):
+        """A single early change on a long video must still get a SPARSE
+        warning for the long silent stretch after it -- sparse_gaps only
+        ever saw gaps between samples, never the gap from the last sample to
+        the end of the probed video, which is exactly the case (a light
+        slide slipping under the threshold) the warning exists for."""
+        folder = self._setup(tmp_path, monkeypatch)
+        fake = DetectFakeRun(change_times=[5.0], dur=1800.0, hash_by_ss={"1.50": HASH_A, "6.50": HASH_B})
+        monkeypatch.setattr(slides, "run", fake)
+        cmd_detect(self._args(folder, sparse=180))
+        out = capsys.readouterr().out
+        assert "SPARSE 00:06..29:59" in out
 
     def test_samples_tsv_carries_the_dup_of_column(self, tmp_path, monkeypatch):
         folder = self._setup(tmp_path, monkeypatch)
@@ -564,6 +641,47 @@ class TestCmdTile:
         out = capsys.readouterr().out
         assert out.count("TILE=") == 4
 
+    def test_grabs_a_single_frame_so_an_animated_source_does_not_choke_ffmpeg(self, tmp_path, monkeypatch):
+        """Without -frames:v 1, ffmpeg happily decodes every frame of an
+        animated GIF (which add-shot accepts) and refuses to write them all
+        to one .jpg -- add-shot's own accepted formats include .gif, so tile
+        must cap it to one frame like every other single-frame grab in this
+        script does."""
+        _fake_tools(monkeypatch)
+        folder = write_source(tmp_path)
+        monkeypatch.setenv(slides.WORKROOT_ENV, str(tmp_path / "workroot"))
+        slides_dir = folder / "slides"
+        slides_dir.mkdir()
+        (slides_dir / "0005-a.webp").write_bytes(b"x")
+
+        calls = []
+
+        def fake(cmd, text=True):
+            calls.append(cmd)
+            with open(cmd[-1], "wb") as fh:
+                fh.write(b"x")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(slides, "run", fake)
+        cmd_tile(_mkargs(dir=str(folder), slide=None))
+        assert all("-frames:v" in c and "1" in c[c.index("-frames:v") + 1] for c in calls)
+
+    def test_die_message_includes_ffmpeg_stderr(self, tmp_path, monkeypatch):
+        _fake_tools(monkeypatch)
+        folder = write_source(tmp_path)
+        monkeypatch.setenv(slides.WORKROOT_ENV, str(tmp_path / "workroot"))
+        slides_dir = folder / "slides"
+        slides_dir.mkdir()
+        (slides_dir / "0005-a.webp").write_bytes(b"x")
+
+        monkeypatch.setattr(
+            slides, "run",
+            lambda cmd, text=True: SimpleNamespace(returncode=1, stdout="", stderr="a very specific ffmpeg gripe"),
+        )
+        with pytest.raises(SystemExit) as exc:
+            cmd_tile(_mkargs(dir=str(folder), slide=None))
+        assert "a very specific ffmpeg gripe" in str(exc.value)
+
 
 class TestCmdLayout:
     def test_uses_default_percentages_and_prints_crop_help(self, tmp_path, monkeypatch, capsys):
@@ -624,6 +742,80 @@ def _draw_slide(path, bg, box, x, y):
     )
 
 
+def _draw_text_segment(path, title, bullets, dur):
+    """A `dur`-second white slide in the same drawtext template two different
+    talks would share -- a title line plus a couple of bullets -- so a dedupe
+    regression can vary only the words, never the layout. Rendered as its own
+    short clip (not a still stretched by the concat demuxer's ``duration``
+    directive, which drops a short list's final entry) so two of these concat
+    to an exact, known-length video."""
+    font = find_font()
+    if not font:
+        pytest.skip("no monospace font on FONT_CANDIDATES to render text slides with")
+    escaped_font = font.replace(":", "\\:")
+    draws = []
+    y = 100
+    for size, text in [(60, title)] + [(36, b) for b in bullets]:
+        escaped_text = text.replace(":", "\\:").replace("'", "\\'")
+        draws.append(
+            f"drawtext=fontfile='{escaped_font}':text='{escaped_text}':x=80:y={y}:"
+            f"fontsize={size}:fontcolor=black"
+        )
+        y += size + 40
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+         "-i", f"color=c=white:s=1280x720:d={dur}:r=10",
+         "-vf", ",".join(draws), "-pix_fmt", "yuv420p", "-y", str(path)],
+        check=True,
+    )
+
+
+def _build_text_slides_video(build_dir):
+    """Two 3s slides built from the same title-plus-bullets template, words
+    only differing -- the shape a real talk's slide deck actually takes."""
+    one, two = build_dir / "one.mp4", build_dir / "two.mp4"
+    _draw_text_segment(one, "Why agents forget things",
+                        ["bullet one about memory", "bullet two about context"], dur=3)
+    _draw_text_segment(two, "Context management layer",
+                        ["bullet one about routing", "bullet two about caching"], dur=3)
+
+    listing = build_dir / "list.txt"
+    listing.write_text("file 'one.mp4'\nfile 'two.mp4'\n", encoding="utf-8")
+    out = build_dir / "text.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+         "-i", str(listing), "-r", "10", "-vsync", "cfr", "-pix_fmt", "yuv420p", "-y", str(out)],
+        check=True, cwd=build_dir,
+    )
+    return out
+
+
+@pytest.mark.skipif(FFMPEG_MISSING, reason="ffmpeg/ffprobe not on PATH")
+def test_thumbnail_hash_does_not_dedupe_two_different_text_slides_sharing_a_template(tmp_path):
+    """Two slides built from the same title-plus-bullets template, with
+    completely different words, must hash far enough apart that dedupe()
+    never calls them a duplicate -- that would hide real content behind a
+    DUP line and drop it from the contact sheets. Goes straight at the
+    dHash/dedupe pair with real ffmpeg-extracted frames, rather than through
+    `detect`'s scene-change filter (a separate mechanism, covered elsewhere,
+    whose sensitivity to a mostly-static text slide is not what this bug is
+    about)."""
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    video_path = _build_text_slides_video(build_dir)
+
+    # Re-resolve the real ffmpeg binary: an earlier faked-tools test may have
+    # cached "/fake/ffmpeg" in the module-level TOOLS dict, which cmd_detect
+    # would normally refresh with its own need("ffmpeg") call before this.
+    slides.need("ffmpeg")
+    h1 = slides.thumbnail_hash(str(video_path), 1.5)
+    h2 = slides.thumbnail_hash(str(video_path), 4.5)
+
+    assert dedupe([h1, h2], threshold=slides.DEFAULT_DUP_THRESHOLD) == [None, None], (
+        f"distinct same-template slides collided as a dup (hamming={hamming(h1, h2)})"
+    )
+
+
 def _build_synthetic_video(build_dir):
     """A ~36s static-slide video: A, B, a 1s flash, a repeat of B, a
     uniformly dimmed copy of B, and D -- with known cut times."""
@@ -654,7 +846,7 @@ def _build_synthetic_video(build_dir):
 
 
 @pytest.mark.skipif(FFMPEG_MISSING, reason="ffmpeg/ffprobe not on PATH")
-def test_detect_dedupes_a_repeat_and_a_dimmed_copy_and_extract_never_overwrites(tmp_path, monkeypatch):
+def test_detect_dedupes_a_repeat_and_a_dimmed_copy_and_extract_never_overwrites(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv(slides.WORKROOT_ENV, str(tmp_path / "workroot"))
     folder = write_source(tmp_path, vid="ABCDEFGHIJK", slug="synth-talk")
 
@@ -668,6 +860,7 @@ def test_detect_dedupes_a_repeat_and_a_dimmed_copy_and_extract_never_overwrites(
     args = _mkargs(dir=str(folder), crop="full", threshold=0.04, merge=2.5, settle=1.5,
                    fps=2, sparse=180, dup_threshold=14, keep_dups=False)
     cmd_detect(args)
+    out = capsys.readouterr().out
 
     tsv = open(os.path.join(work, "samples.tsv"), encoding="utf-8").read().splitlines()[1:]
     rows = [dict(zip(["index", "first", "sample_seconds", "sample_clock", "dup_of"], r.split("\t")))
@@ -677,16 +870,26 @@ def test_detect_dedupes_a_repeat_and_a_dimmed_copy_and_extract_never_overwrites(
         return next(r for r in rows if lo <= float(r["sample_seconds"]) < hi)
 
     b_original = group_in(7.0, 14.0)
-    b_repeat = group_in(15.0, 22.0)
+    # The changes at 14s (the flash's own onset) and 15s (its return to B)
+    # are within `merge` of each other, so this is one merged group, not a
+    # second, separate repeat of B -- its own dHash still lands on B's, since
+    # its sample is taken after the flash has already ended.
+    flash_and_return_to_b = group_in(15.0, 22.0)
     b_dimmed = group_in(22.0, 29.0)
     slide_a = group_in(0.0, 7.0)
     slide_d = group_in(29.0, 36.0)
 
     assert b_original["dup_of"] == ""
-    assert b_repeat["dup_of"] == b_original["index"]
+    assert flash_and_return_to_b["dup_of"] == b_original["index"]
     assert b_dimmed["dup_of"] == b_original["index"]
     assert slide_a["dup_of"] == ""
     assert slide_d["dup_of"] == ""
+    # The flash itself must not pass through silently: a merged group this
+    # short (n=2, spanning under a second) gets a BURST cue naming its own
+    # index, so re-sampling it (and so recovering the flash's own frame) is
+    # one copy-pasted command away rather than requiring the reader to notice
+    # its absence from the sheets.
+    assert f"BURST {flash_and_return_to_b['index']} " in out
 
     extract_args = _mkargs(dir=str(folder), pick=[f"{b_original['sample_seconds']}=test-slide"],
                             quality=82, crop="full")
