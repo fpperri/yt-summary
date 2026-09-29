@@ -66,6 +66,10 @@ TILE_READ_W = 1600  # width the `tile` reading crops are upscaled to
 # threshold of 14. 32x32 pushes the same pair past 25 while still catching a
 # genuine dimmed repeat (measured ~11 bits at this size).
 HASH_W, HASH_H = 32, 32
+# Calibrated against slides kept by hand on seven recorded talks: 14 never hid
+# a kept slide's only sample on any of them, but a template-heavy deck already
+# did at 18, so the default stays conservative. Repetitive overlay layouts
+# tolerate ~60 (see the skill's DUP notes).
 DEFAULT_DUP_THRESHOLD = 14
 
 WORKROOT_ENV = "SLIDES_WORKROOT"

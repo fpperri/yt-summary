@@ -65,6 +65,13 @@ python {plugin_dir}/scripts/slides.py detect --dir <source folder> --crop <full|
   another's template) as a duplicate of the earlier, less-complete one — if a `SHEET` looks
   like it is missing a slide you know is there, re-run with `--keep-dups` and check the frame
   yourself rather than trusting the DUP line.
+  The default threshold only catches near-identical repeats. Calibrated against the slides
+  kept by hand on seven recorded talks, it never hid a kept slide, but it also removed
+  almost nothing (1 sample in about 300). Template-heavy decks are why it is set that low:
+  on one talk, a threshold of 18 already hid a kept slide. Layouts that keep repeating the
+  same card (numbered progress cards, overlay cards over a talking head) tolerate far more:
+  on one overlay talk, `--dup-threshold 64` dropped 53 of 130 samples and still kept every
+  slide. Raise it for that kind of layout, and check the DUP list.
 - **`BURST <i> ... n=<count> changes`** flags a group of two or more raw scene changes that
   collapsed into one sample — an animation building up over several steps, or a brief flash
   (a one-off slide on screen just a second or two) whose own content the settled sample never
