@@ -88,6 +88,13 @@ class NotYetAired(RuntimeError):
     """Raised when a video is a premiere/live event that hasn't started."""
 
 
+class TranscriptUnavailable(RuntimeError):
+    """Raised when a source gave a definitive answer that no transcript can be
+    had (no English captions, a private or deleted video). Typed so that
+    failure_kind trusts it over the message, which still embeds the other
+    source's error — and a blocked API's repr alone reads as a rate limit."""
+
+
 def failure_kind(error) -> str:
     """Classify an exception or message string as one of "rate_limited",
     "not_yet_aired", "network" or "failed", in that precedence order.
@@ -97,6 +104,8 @@ def failure_kind(error) -> str:
     surfaced elsewhere (e.g. a caught ``CalledProcessError``), so it accepts
     either.
     """
+    if isinstance(error, TranscriptUnavailable):
+        return "failed"
     message = str(error)
     if isinstance(error, RateLimited) or _RATE_LIMITED_RE.search(message):
         return "rate_limited"
@@ -401,7 +410,7 @@ def fetch_segments(video_id: str, languages=None) -> tuple[list[tuple[float, str
                 raise RuntimeError(message) from ytdlp_error
             if failure_kind(api_error) == "not_yet_aired":
                 raise NotYetAired(message) from ytdlp_error
-            raise RuntimeError(message) from ytdlp_error
+            raise TranscriptUnavailable(message) from ytdlp_error
 
 
 def render(segments, with_timestamps: bool = False) -> str:

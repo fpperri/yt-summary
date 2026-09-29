@@ -137,8 +137,8 @@ def list_channel(base_url: str, tabs=TABS, on_tab_error=None, limit_per_tab=None
     idempotence means a later rerun never notices the gap. The caller gets told
     either way and decides whether to care.
 
-    ``on_tab_listed`` gets each successful tab's raw video count and last
-    (oldest-listed) video id *before* the cross-tab dedupe below removes
+    ``on_tab_listed`` gets each successful tab's video count *before* the
+    cross-tab dedupe below removes
     anything — a caller deciding whether ``limit_per_tab`` actually cut a tab
     off needs the count yt-dlp returned for that tab alone, not what survived
     dedupe against every other tab.
@@ -151,7 +151,7 @@ def list_channel(base_url: str, tabs=TABS, on_tab_error=None, limit_per_tab=None
             if on_tab_error:
                 on_tab_error(tab, error)
         elif on_tab_listed:
-            on_tab_listed(tab, len(videos), videos[-1]["video_id"] if videos else None)
+            on_tab_listed(tab, len(videos))
         for video in videos:
             if video["video_id"] in seen:
                 continue
@@ -237,11 +237,12 @@ def apply_date_window(videos, cutoff, known_dates, stop_after_old=5, pace=0.0, o
     to survive.
 
     A probe can also raise (rate-limited, network error). Without
-    ``on_probe_error`` that propagates, as before. With it, the whole walk
-    stops right there — no further probes on any tab — the exception goes to
-    ``on_probe_error`` instead of the caller, and whatever was kept so far is
-    returned, still newest first: a caller (a sweep) would rather log the
-    channel as cut short and move on than lose videos it already dated.
+    ``on_probe_error`` that propagates, as before. With it, the exception goes
+    to ``on_probe_error`` and probing stops for the rest of the walk, on every
+    tab, but the walk itself goes on: videos RSS already dated cost nothing to
+    keep, and a caller (a sweep) would rather log the channel as cut short than
+    lose them. Videos that would have needed a probe are skipped like
+    undatable ones.
 
     ``on_tab_walked(tab, stopped_early)`` fires once per tab once its group is
     done, ``stopped_early`` true only when the ``stop_after_old`` run actually
@@ -250,14 +251,14 @@ def apply_date_window(videos, cutoff, known_dates, stop_after_old=5, pace=0.0, o
     accumulating that run means the window's end was never confirmed, whether
     the last entries were merely too few, or undatable and skipped outright.
     """
-    kept, probed = [], False
+    kept, probed, probing = [], False, True
 
     for tab, group in groupby(videos, key=lambda v: v.get("tab")):
         consecutive_old = 0
         stopped_early = False
         for video in group:
             published = known_dates.get(video["video_id"])
-            if published is None:
+            if published is None and probing:
                 if probed and pace:
                     time.sleep(pace)
                 try:
@@ -266,8 +267,7 @@ def apply_date_window(videos, cutoff, known_dates, stop_after_old=5, pace=0.0, o
                     if on_probe_error is None:
                         raise
                     on_probe_error(exc)
-                    kept.sort(key=lambda v: v["published"], reverse=True)
-                    return kept
+                    probing, published = False, ""
                 probed = True
 
             if not published:
@@ -295,28 +295,32 @@ def window_channel(base_url, cutoff, stop_after_old=5, probe_pace=1.0,
     """List a channel and keep only what falls inside the date window — the
     list -> RSS -> date-window sequence a sweep and ``main`` both need.
 
-    A listing or a probe failure (an exhausted rate limit, a network error)
-    propagates rather than being folded into "nothing in the window", since a
+    A listing failure, and a probe failure unless ``on_probe_error`` is given
+    (see ``apply_date_window``), propagates rather than being folded into
+    "nothing in the window", since a
     caller retrying blind on an empty result would never notice the channel
     was never actually walked. A failed RSS lookup is not that: it only makes
     dating more expensive (every video gets probed individually), so it falls
     back to an empty dict instead, and ``on_rss_miss`` lets the caller say so.
 
-    ``on_cap_hit(tab, limit_per_tab)`` fires for a tab whose raw listing (the
-    count of lines yt-dlp printed, before id filtering or cross-tab dedupe)
-    was cut off at ``limit_per_tab`` *and* whose walk never confirmed the
-    window had ended inside it — i.e. never saw a run of ``stop_after_old``
-    consecutive out-of-window videos — meaning videos beyond the cap could
-    plausibly still be in-window too, and were never even listed. A tab whose
-    raw listing came up short of the cap on its own, or whose early stop
-    above did fire, never fires it — including when the reason it never fired
-    is that the tab's tail is an undatable premiere or members-only video
-    rather than genuinely too few old videos.
+    ``on_cap_hit(tab, limit_per_tab)`` fires for a tab whose listing (counted
+    before cross-tab dedupe) was cut off at ``limit_per_tab`` *and* whose walk
+    never confirmed the window had ended inside it — never saw a run of
+    ``stop_after_old`` consecutive out-of-window videos — so videos beyond the
+    cap could still be in-window and were never listed. That includes a tab
+    whose tail is an undatable premiere or members-only video. A tab listed
+    short of the cap, or whose early stop fired, never triggers it, and
+    neither does any tab once a probe error cut the walk short: an unfinished
+    walk cannot say whether the cap hid anything.
     """
-    tab_listings, stopped_early = {}, {}
+    tab_listings, stopped_early, probe_errors = {}, {}, []
 
-    def _note_tab(tab, raw_count, _last_video_id):
+    def _note_tab(tab, raw_count):
         tab_listings[tab] = raw_count
+
+    def _note_probe_error(exc):
+        probe_errors.append(exc)
+        on_probe_error(exc)
 
     def _note_walked(tab, tab_stopped_early):
         stopped_early[tab] = tab_stopped_early
@@ -331,9 +335,10 @@ def window_channel(base_url, cutoff, stop_after_old=5, probe_pace=1.0,
         if on_rss_miss:
             on_rss_miss(exc)
     kept = apply_date_window(videos, cutoff, known, stop_after_old, probe_pace,
-                             on_probe_error=on_probe_error, on_tab_walked=_note_walked)
+                             on_probe_error=_note_probe_error if on_probe_error else None,
+                             on_tab_walked=_note_walked)
 
-    if on_cap_hit and limit_per_tab:
+    if on_cap_hit and limit_per_tab and not probe_errors:
         for tab, raw_count in tab_listings.items():
             if raw_count == limit_per_tab and not stopped_early.get(tab, False):
                 on_cap_hit(tab, limit_per_tab)

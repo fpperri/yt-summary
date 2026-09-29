@@ -461,9 +461,9 @@ class TestWindowChannel:
         with pytest.raises(yt.RateLimited):
             cv.window_channel("https://www.youtube.com/@c", "2026-08-01")
 
-    def test_on_probe_error_stops_the_walk_and_keeps_what_was_dated_so_far(self, monkeypatch):
+    def test_on_probe_error_takes_the_error_and_keeps_what_was_dated(self, monkeypatch):
         """RSS dates two /videos uploads in-window; a /shorts probe 429s. With
-        on_probe_error given, the walk stops there instead of propagating, and
+        on_probe_error given, the error goes to it instead of propagating, and
         the callback receives the RateLimited so a caller can log and move on."""
         fake = FakeYtDlp(
             tabs={
@@ -483,6 +483,50 @@ class TestWindowChannel:
         assert [v["video_id"] for v in kept] == ["aaaaaaaaaaa", "bbbbbbbbbbb"]
         assert len(errors) == 1
         assert isinstance(errors[0], yt.RateLimited)
+
+    def test_after_a_probe_error_rss_dated_videos_still_count(self, monkeypatch):
+        """Dating a video RSS already covers costs nothing, so a throttled probe
+        stops the probing, not the walk: RSS-dated videos later in the same
+        tab and on later tabs survive, and nothing else is probed."""
+        fake = FakeYtDlp(
+            tabs={
+                "videos": [("aaaaaaaaaaa", "t1"), ("bbbbbbbbbbb", "t2"), ("ccccccccccc", "t3"),
+                           ("ddddddddddd", "t4")],
+                "shorts": [("eeeeeeeeeee", "t5")],
+            },
+            dates={"bbbbbbbbbbb": "RATE_LIMITED", "ddddddddddd": "20260825"},
+        )
+        monkeypatch.setattr(cv.yt, "run_ytdlp", fake)
+        monkeypatch.setattr(cv.urllib.request, "urlopen", self.fake_urlopen({
+            "aaaaaaaaaaa": "2026-08-30", "ccccccccccc": "2026-08-20", "eeeeeeeeeee": "2026-08-28",
+        }))
+
+        errors = []
+        kept = cv.window_channel("https://www.youtube.com/@c", "2026-08-01", probe_pace=0,
+                                 on_probe_error=errors.append)
+        assert [v["video_id"] for v in kept] == ["aaaaaaaaaaa", "eeeeeeeeeee", "ccccccccccc"]
+        assert len(errors) == 1
+        probed = [c[-1] for c in fake.calls if "--flat-playlist" not in c and "-J" not in c]
+        assert probed == ["https://www.youtube.com/watch?v=bbbbbbbbbbb"]
+
+    def test_a_walk_cut_short_by_a_probe_error_reports_no_cap_hit(self, monkeypatch):
+        """The walk never finished, so it cannot say whether the cap hid
+        anything; blaming the cap would point at the wrong fix."""
+        fake = FakeYtDlp(
+            tabs={"videos": [("aaaaaaaaaaa", "t1"), ("bbbbbbbbbbb", "t2")],
+                  "shorts": [("ccccccccccc", "t3"), ("ddddddddddd", "t4")]},
+            dates={"bbbbbbbbbbb": "RATE_LIMITED"},
+        )
+        monkeypatch.setattr(cv.yt, "run_ytdlp", fake)
+        monkeypatch.setattr(cv.urllib.request, "urlopen", self.fake_urlopen({
+            "aaaaaaaaaaa": "2026-08-30", "ccccccccccc": "2026-08-29", "ddddddddddd": "2026-08-28",
+        }))
+
+        hits = []
+        cv.window_channel("https://www.youtube.com/@c", "2026-08-01", probe_pace=0, limit_per_tab=2,
+                          on_probe_error=lambda exc: None,
+                          on_cap_hit=lambda tab, limit: hits.append(tab))
+        assert hits == []
 
     def test_cap_hit_fires_when_a_tabs_raw_listing_was_capped_and_its_tail_is_still_in_window(self, monkeypatch):
         fake = FakeYtDlp(tabs={"videos": [("aaaaaaaaaaa", "t1"), ("bbbbbbbbbbb", "t2")]})
@@ -625,7 +669,7 @@ class TestApplyDateWindow:
         videos = [self.video("aaaaaaaaaaa")]
         apply_date_window(videos, "2026-08-01", {"aaaaaaaaaaa": "2026-08-30"}, pace=5.0)
 
-    def test_on_probe_error_stops_the_walk_instead_of_raising(self, monkeypatch):
+    def test_on_probe_error_stops_probing_instead_of_raising(self, monkeypatch):
         def probe(vid):
             if vid == "ccccccccccc":
                 raise yt.RateLimited("HTTP Error 429: Too Many Requests")

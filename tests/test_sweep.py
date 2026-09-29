@@ -433,3 +433,33 @@ class TestExitCode:
         """A blocked IP means channels are still un-walked no matter how many
         videos got ingested before the walk hit the block."""
         assert sweep_module.exit_code(self.result(channels_blocked=1, ingested=1)) == 2
+
+
+class RequestBlocked(Exception):
+    """Named like youtube_transcript_api's exception so its repr matches."""
+
+
+def test_a_blocked_api_on_an_uncaptioned_video_fails_it_instead_of_backing_off(tmp_path, monkeypatch):
+    """Through the real ingest and fetch_segments: the API is blocked, and
+    yt-dlp answers definitively that there is nothing to fetch. That video is
+    a failure to move past, not a rate limit to wait out for hours."""
+    monkeypatch.setattr(
+        sweep_module.cv, "window_channel",
+        lambda url, cutoff, *a, **k: [{"video_id": "aaaaaaaaaaa", "title": "A Talk",
+                                       "channel": "Chan", "published": "2026-09-01", "tab": "videos"}],
+    )
+    monkeypatch.delenv("YT_NO_API", raising=False)
+    monkeypatch.setattr(sweep_module.yt, "via_api",
+                        lambda v, l=None: (_ for _ in ()).throw(RequestBlocked()))
+    monkeypatch.setattr(sweep_module.yt, "via_ytdlp",
+                        lambda v: (_ for _ in ()).throw(RuntimeError("no vtt written")))
+    sleeps = []
+    monkeypatch.setattr(sweep_module.time, "sleep", sleeps.append)
+
+    manifest = tmp_path / "channels.txt"
+    manifest.write_text("@alpha\n", encoding="utf-8")
+    result = sweep(manifest, tmp_path / "out", since_days=3650, pace=0)
+
+    assert (result["failed"], result["blocked"]) == (1, False)
+    assert all(s < 60 for s in sleeps)
+    assert sweep_module.exit_code(result) == 1

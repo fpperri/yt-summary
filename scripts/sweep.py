@@ -117,8 +117,8 @@ def collect_candidates(channels, since_days, limit_per_channel=None, stop_after_
                 on_rss_miss=lambda exc, c=channel: log(
                     f"RSS-MISS {c}: {exc} — dating each video individually", logpath),
                 on_cap_hit=lambda tab, limit, c=channel: log(
-                    f"CAP-HIT {c} /{tab}: listing stopped at {limit} with its oldest video "
-                    "still in the window — raise --max-listed (0 = unlimited)", logpath),
+                    f"CAP-HIT {c} /{tab}: listing stopped at {limit} without confirming the "
+                    "window had ended — raise --max-listed (0 = unlimited)", logpath),
                 on_probe_error=_on_probe_error,
             )
         except Exception as exc:

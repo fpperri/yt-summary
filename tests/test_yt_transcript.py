@@ -339,6 +339,10 @@ class TestRender:
         assert render(self.segments, False) == "alpha beta"
 
 
+class RequestBlocked(Exception):
+    """Named like youtube_transcript_api's exception so its repr matches."""
+
+
 class TestFetchSegments:
     def test_prefers_the_api(self, monkeypatch):
         monkeypatch.delenv("YT_NO_API", raising=False)
@@ -408,7 +412,7 @@ class TestFetchSegments:
         monkeypatch.delenv("YT_NO_API", raising=False)
         monkeypatch.setattr(
             yt_transcript, "via_api",
-            lambda v, l=None: (_ for _ in ()).throw(RuntimeError("RequestBlocked")),
+            lambda v, l=None: (_ for _ in ()).throw(RequestBlocked()),
         )
         monkeypatch.setattr(
             yt_transcript, "via_ytdlp",
@@ -417,6 +421,9 @@ class TestFetchSegments:
         with pytest.raises(RuntimeError) as exc_info:
             fetch_segments(VID)
         assert not isinstance(exc_info.value, RateLimited)
+        # The sweep classifies with failure_kind, and the message still embeds
+        # the API error's repr ("RequestBlocked()"), which alone reads as a block.
+        assert failure_kind(exc_info.value) == "failed"
 
     def test_ytdlp_network_failure_falls_back_to_an_api_rate_limit(self, monkeypatch):
         """yt-dlp saw only a transport failure, no definitive verdict, so the
