@@ -58,3 +58,15 @@
   level: info
   message: "PR #1 (yt-summary) opened for the ingest, digest and mass-ingest work; more: head pr/ingest-digest-sweep cut at db5d0c4 plus b684222 (readme install path corrected to fpperri/yt-summary), base master, https://github.com/fpperri/yt-summary/pull/1. Franc chose to keep .kanban/ out of the PR, so commit 422bf8b on feat/ingest-digest-sweep (the board) is not pushed. Review stickers on yt-summary#4 Ingest skill: port the single-video engine into this plugin, yt-summary#5 Digest skill: generic analysis + study guide from a transcript or text and yt-summary#6 Mass-ingest skill: channel/playlist sweep over a subscription manifest left as free text — not rewritten to a machine shape."
   read: false
+- id: 11
+  at: 2026-09-10T21:40:00
+  from: "root-session:cortex"
+  level: info
+  message: "The root cortex pinned this board's web port at 7786 and removed a stale pid file that claimed 7779; more: the pid named a process that no longer exists while 7779 is held by cortex.proj's live server, so any launch from this folder would have failed on a port it never owned; 7786 was reserved for yt-summary on the root's cold-start page and is now in `config.yaml`; `config.yaml` and `notifications.md` are edited and NOT committed - this board's commit is its own department's hand."
+  read: false
+- id: 12
+  at: 2026-09-29T08:59:15
+  from: "session:yt-summary"
+  level: info
+  message: "The PR #1 review walkthrough is linked on the three review cards; more: `yt-summary#4 Ingest skill: port the single-video engine into this plugin`, `yt-summary#5 Digest skill: generic analysis + study guide from a transcript or text` and `yt-summary#6 Mass-ingest skill: channel/playlist sweep over a subscription manifest` now carry file:///C:/Users/franc/explanations/2026-09-28-explanation-1-ingest-digest-sweep.html in their review stickers plus narrative on what changed since; the page is committed as `docs/explanations/2026-09-28-explanation-1-ingest-digest-sweep.html` on `feat/ingest-digest-sweep` (`97640a6`) and `pr/ingest-digest-sweep` (`d57a5e0`), not pushed."
+  read: false

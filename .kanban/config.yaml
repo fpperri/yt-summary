@@ -1,2 +1,3 @@
 # board config — see the kanban skill's config.yaml section
 name: yt-summary   # board name for card mentions — see kanban.proj#237
+port: 7786   # kanban-web serving port, pinned so bookmarks never drift (root's cold-start page reserved 7786 for yt-summary; set 2026-09-10)
